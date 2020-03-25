@@ -15,57 +15,86 @@ use Pod::Usage;
 
 =head1 NAME
 
-FLT3_ITD_ext.pl  Process bamfiles or paired fastq files for FLT3-ITDs
+FLT3_ITD_ext  Process bamfiles or fastqs for FLT3-ITDs
 
 =head1 SYNOPSIS
 
   --bam, -b	Input bamfile (either this or fastq1+2 required)
-  --typeb, -t	Reads to extract from input bam (defaults to "targeted" for FLT3 alignments; or can be "all")
+  --typeb, -t	Reads to extract from input bam (defaults to "targeted" [FLT3-aligned]; or can be "loose" or "all")
   --fastq1, -f1	Input fastq1 (either fastq1+2 or bam required)
   --fastq2, -f2	Input fastq2 (either fastq1+2 or bam required)
   --output, -o  Output path (required)
-  --arch, -a	Archive small fastq files (defaults to false)
-  --debug, -d	Debugging files (defaults to false)
+  --ngstype, -n NGS platform type (defaults to "HC" [hybrid capture]; or can be "amplicon", "NEB", or "Archer")
+  --genome, -g  Genome build (defaults to "hg19"; or can be "hg38")
+  --adapter, -a	Trim adapters (defaults to true; assumes illumina)
   --web, -w	Create html webpages for each ITD call (defaults to true)
+  --umitag, -u  BAM tag holding UMIs in the input bamfile for fgbio (defaults to ""; standard is "RX")
+  --probes, -p  Probes/baits file basename (defaults to ""); assumes fasta file, bwa indexfiles
+  --debug, -d	Save all intermediate files (defaults to false)
   --help, -h	Print this help
 
 =head1 VERSION
 
-0.01
+1.0
 
 =cut
 
 GetOptions(
   "bam|b=s" => \(my $inbam = "" ),
-  "typeb|t=s" => \ (my $typeb = "targeted"),
+  "typeb|t=s" => \(my $typeb = "targeted"),
   "fastq1|f1=s" => \(my $fastq1 = ""),
   "fastq2|f2=s" => \(my $fastq2 = ""),
   "output|o=s" => \ my $outpath,
-  "arch|a" => \(my $archive = 0 ),
+  "ngstype|n=s" => \(my $ngstype = "HC"),
+  "genome|g=s" => \(my $genome = "hg19"),
+  "adapter|a=s" => \(my $adapter = 1),
+  "web|w=s" => \(my $web = 1),
+  "umitag|u=s" => \(my $umitag = ""),
+  "probes|p=s" => \(my $probes = ""),
   "debug|d" => \(my $debug = 0),
-  "web|w" => \(my $web = 1),
   "help|h" => sub { HelpMessage(0) }, 
 ) or HelpMessage(1);
 
 HelpMessage(1) unless( $outpath && (length($inbam)>0 || (length($fastq1)>0 && length($fastq2)>0)) );
+if( $typeb ne "targeted" && $typeb ne "loose" && $typeb ne "all" ) {
+    print "Unrecognized typeb (must be targeted, loose, or all)\n";
+    HelpMessage(1);
+}
+if( $genome ne "hg19" && $genome ne "hg38" ) {
+    print "Unrecognized genome build (must be hg19 or hg38)\n";
+    HelpMessage(1);
+}
+if( $ngstype ne "HC" && $ngstype ne "amplicon" && $ngstype ne "NEB" && $ngstype ne "Archer" ) {
+    print "Unrecognized ngstype (must be HC, amplicon, NEB, or Archer)\n";
+    HelpMessage(1);
+}
+if( $ngstype eq "HC" && $probes ne "" ) { print "Ignoring probes for HC...\n"; $probes = ""; }
+if( $ngstype eq "NEB" && $probes eq "" ) { print "Need probes for NEB...\n"; HelpMessage(1); }
+if( $ngstype eq "Archer" && $probes eq "" ) { print "Need probes for Archer...\n"; HelpMessage(1); }
+if( $inbam eq "" && $umitag ne "" ) { print "Need bamfile with umi tags...\n"; HelpMessage(1); }
 
-my $samcmd = "/apps/samtools/1.9/bin/samtools";
-my $bedcmd = "/apps/bedtools2/2.23.0/bamToFastq";
-my $bwacmd = "/apps/bwa/0.7.17/bwa";
-my $clustercmd = "/home/ht50/tools/sumaclust_v1.0.31/sumaclust";
+# CHANGE THIS TO LOCATION OF FLT3 INDEX (FLT3_dna_e14e15.fa, etc)
+my $refindex = "FLT3_dna_e14e15"; 
+
+# THESE COMMANDS OR FILES NEED TO BE IN $PATH; OTHERWISE CHANGE TO THEIR FULL PATHNAME 
+my $samcmd = "samtools";
+my $bedcmd = "bamToFastq";
+my $bwacmd = "bwa";
+my $clustercmd = "sumaclust";
+my $javacmd = "java"; # the java cmd needs to be in $PATH (e.g. "/apps/java/jdk1.8.0_191/bin/java";)
+my $fgbiojar = "fgbio.jar";
+my $trimcmd = "bbduk.sh";
 
 my $minToCluster = 1;
-my $maxEditDist = 5;  #$maxEditDist = 4;
+my $maxEditDist = 5;  
 my $maxInsAllowed = 2; # cannot have more than this in total ins to count as wt or itd
 my $maxDelAllowed = 2; # cannot have more than this in total del to count as wt or itd
 my $maxClipAllowed = 2; # cannot have more than this in max softclip to count as wt or itd
-my $clipFilterRatio = 0.6;  # ratio of total clipping length to sequence length needs to be greater than this value to pass filter
-my $mutFilterRatio = 0.05;  # ratio of total number of mismatches + deletions to matched sequence length must be greater than this value to pass filter
-my $minClipToAlign = 9;
-my $manualItdCheckLength = 12;
+my $minClipToAlign = 9; 
+my $manualItdCheckLength = 12; 
 my $buffer = 10;  # buffer size past breakpoint needed for alignment to be included in counts
-
 my $clipMatchRatioThreshold = 0.5; # ratio of clip matches to clip length needs to be at least this value in order to extend the clip
+my $maxITDsize = 500;
 
 # May be able to merge these, however staggered approach generates less false positives
 my $bwaSeedLength = 15;
@@ -73,18 +102,15 @@ my $bwaThreshold = 12;
 my $bwaClipsSeedLength = 6;
 my $bwaClipsThreshold = 9;
 
-#### reference FLT3 sequence (1500bp region centered around e14e15): chr13_28607438_28608937_minus_strand
-my $basedir = "/home/ht50/FLT3/";
-my $gene = "FLT3"; my $transcript = "NM_004119"; 
-my $refkey = "FLT3_dna_e14e15";
-my $refindex = $basedir . $refkey;
-my $refstart = 28607438; my $refend = 28608937;  # 1500bp centered around exons 14-15 (with 586bp buffer)
-my $target_region = "13:" . $refstart .  "-" . $refend;
-my $reffasta = $basedir . $refkey . ".fa";
-my $refseq = ""; 
+#### reference FLT3 sequence
+#### 1500bp centered around exons 14-15 (with 586bp buffer): chr13_28607438_28608937_minus_strand under hg19
+my $refstart = 28607438; my $refend = 28608937; my $targetregion = "";  
+if( $genome eq "hg38" ) { $refstart = 28033301; $refend = 28034800; }
+my $reffasta = $refindex . ".fa"; my $refseq = ""; 
 open (FI, $reffasta ) or die $!;
 while(<FI>) { if( !/^>/ ) { chomp; $refseq .= $_; } }
 close FI;
+
 
 my $alignerLocal  = "bwa";  # "bwa" or "novo" or "bowtie2"
 my $alignerClips  = "bwa";  # used for aligning softclips to reference
@@ -99,14 +125,10 @@ my $proc_index = 0;
 my $proc_one_itd_per_size = 0;
 my $proc_singleread_itds = 0;
 my $proc_anylength_itds = 0;
-my $proc_alignerLocal = 1;
-my $proc_output_rhp = 0;
-
-my $maxITDsize = 500;
-my $maxInsFrac = 0.9; #0.5;  # do not allow ectopic inserts more than this fractional length of the ITD
 
 my @line_cells; my @sub_cells; my @p_cells; my @s_cells; my @a;
 my $key; my $readname; my $cigar; my $seq; my $qa; my $i; my $j; my $k;
+my %readlengths = ();
 
 # protein sequence: p.534-647 in e13-e15 (full codons only)
 my $aaseq = "PFPFIQDNISFYATIGVCLLFIVVLTLLICHKYKKQFRYESQLQMVQVTGSSDNEYFYVDFREYEYDLKWEFPRENLEFGKVLGSGAFGKVMNATAYGISKTGVSIQVAVKMLK";
@@ -123,22 +145,35 @@ my %intronhash = (
 
 my $offrna = 1600; my $offaa = 534;
 
-
 my $vcfheader = "##fileformat=VCFv4.2\n" .
-    "##FORMAT=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">\n" .
-    "##FORMAT=<ID=DP,Number=1,Type=Float,Description=\"Total Depth\">\n" .
-    "##FORMAT=<ID=VD,Number=1,Type=Float,Description=\"Variant Depth\">\n" .
     "##INFO=<ID=GENE,Number=1,Type=String,Description=\"Gene name\">\n" .
     "##INFO=<ID=STRAND,Number=1,Type=String,Description=\"Gene strand\">\n" .
     "##INFO=<ID=SVLEN,Number=.,Type=Integer,Description=\"Difference in length between REF and ALT alleles\">\n" .
     "##INFO=<ID=CDS,Number=1,Type=String,Description=\"CDS annotation (modified)\">\n" .
     "##INFO=<ID=AA,Number=1,Type=String,Description=\"Peptide annotation (modified)\">\n" .
-#    "##INFO=<ID=ALTCDS,Number=1,Type=String,Description=\"Alternative CDS annotation (modified)\">\n" .
-#    "##INFO=<ID=ALTAA,Number=1,Type=String,Description=\"Alternative peptide annotation (modified)\">\n" .
+    "##INFO=<ID=AR,Number=1,Type=Float,Description=\"Allelic Ratio\">\n" .
     "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele Frequency\">\n" .
     "##INFO=<ID=DP,Number=1,Type=Float,Description=\"Total Depth\">\n" .
     "##INFO=<ID=VD,Number=1,Type=Float,Description=\"Variant Depth\">\n" .
+    "##INFO=<ID=AAR,Number=1,Type=Float,Description=\"Adjusted Allelic Ratio (Max Estimate)\">\n" .
+    "##INFO=<ID=AAF,Number=1,Type=Float,Description=\"Adjusted Allele Frequency (Max Estimate)\">\n" .
+    "##INFO=<ID=RAR,Number=1,Type=Float,Description=\"Raw Allelic Ratio\">\n" .
+    "##INFO=<ID=RAF,Number=1,Type=Float,Description=\"Raw Allele Frequency\">\n" .
+    "##INFO=<ID=RDP,Number=1,Type=Float,Description=\"Raw Total Depth\">\n" .
+    "##INFO=<ID=RVD,Number=1,Type=Float,Description=\"Raw Variant Depth\">\n" .
     "##INFO=<ID=SAMPLE,Number=1,Type=String,Description=\"Sample name\">\n" .
+    "##FORMAT=<ID=CR,Number=6,Type=Integer,Description=\"Coverage Radius\">\n" .
+    "##FORMAT=<ID=DB,Number=.,Type=String,Description=\"Duplicated Baits (among fwdP1-P3, revP1-P3, other)\">\n" .
+    "##FORMAT=<ID=NB,Number=.,Type=String,Description=\"Non-binding Baits\">\n" .
+    "##FORMAT=<ID=RB,Number=.,Type=String,Description=\"Reaching Baits capturing mut + wt junctions in R2 (unambiguous)\">\n" .
+    "##FORMAT=<ID=AFB,Number=7,Type=Float,Description=\"Allele frequency by Baits\">\n" .
+    "##FORMAT=<ID=Fwd1,Number=1,Type=String,Description=\"AF details for bait Fwd1\">\n" .
+    "##FORMAT=<ID=Fwd2,Number=1,Type=String,Description=\"AF details for bait Fwd2\">\n" .
+    "##FORMAT=<ID=Fwd3,Number=1,Type=String,Description=\"AF details for bait Fwd3\">\n" .
+    "##FORMAT=<ID=Rev1,Number=1,Type=String,Description=\"AF details for bait Rev1\">\n" .
+    "##FORMAT=<ID=Rev2,Number=1,Type=String,Description=\"AF details for bait Rev2\">\n" .
+    "##FORMAT=<ID=Rev3,Number=1,Type=String,Description=\"AF details for bait Rev3\">\n" .
+    "##FORMAT=<ID=Oth,Number=1,Type=String,Description=\"AF details for reads not assigned to a bait\">\n" .
     "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t";
 
 
@@ -1352,9 +1387,6 @@ sub proc_alignment_dets_hash {
 		}
 	    }
 	    if( length($mmkey)>0 ) { $cdet{keycdotalt} .= "|ref_c." . $mmkey; }	
-
-	    #"ins" . substr( $candidateseq, $leftr1-$leftr0+1, $cdet{itdsize} );
-	    #"ins" . substr( $candidateseq, $leftr1-$leftr0, $cdet{itdsize} );
 	}
     } 
 
@@ -1383,7 +1415,7 @@ sub proc_vcf_from_keyfull {
     }
 
     if( $ref0 !~ /^ref/ || $ref1 !~ /^ref/ ||
-	(length($ins)>0 && $ins !~ /^ins/ ) ) {
+	(length($ins)>0 && $ins !~ /^ins/  ) ) {
 	return( "" );
     }
 
@@ -1420,24 +1452,24 @@ sub proc_vcf_from_keyfull {
 
     my $inspos = $coords0[1];
     if( length($mm0) > 0 ) { $inspos = min(@mmlocs0)-1; }
-
     my $dupstart = $coords1[0];
     if( length($mm1) > 0 ) { $dupstart = max(@mmlocs1)+1; }
 
-    my $insseq = "";
+    my $alt;
+    my $ref;
     if( $inspos+1 >= $dupstart ) {
-	$insseq = substr($seq0, $inspos, $coords0[1]-$inspos) . $ins . substr($seq1, $coords1[0]-1, $inspos-$coords1[0]+1);
-	#my $refbp = substr( $refseq, $inspos-1, 1 );
-	#my $alt = $refbp . $insseq;
-	my $refbp = substr( $refseq, $inspos, 1 );
-	my $alt = $insseq . $refbp;
-	$alt = reverse $alt; $alt =~ tr/ATGCatgc/TACGtacg/; $refbp =~ tr/ATGCatgc/TACGtacg/;
-	return("13\t" . ($refend-$inspos) . "\t" . $keyc . "\t" . $refbp . "\t" . $alt . "\t.\t." );
-	#return("13\t" . ($refend-$inspos+1) . "\t.\t" . $refbp . "\t" . $alt . "\t.\t." );
+	$ref = substr( $refseq, $inspos, 1 );
+	$alt = substr($seq0, $inspos, $coords0[1]-$inspos) . $ins . 
+		  substr($seq1, $coords1[0]-1, $inspos-$coords1[0]+1) . $ref;
+    } else {
+ 	$ref = substr( $refseq, $inspos, $dupstart-$inspos-1 );
+	$alt = substr($seq0, $inspos, $coords0[1]-$inspos) . $ins . 
+		  substr($seq1, $coords1[0]-1, $dupstart-$coords1[0]);
     }
+    $alt = reverse $alt; $alt =~ tr/ATGCatgc/TACGtacg/; 
+    $ref = reverse $ref; $ref =~ tr/ATGCatgc/TACGtacg/;
 
-    #$insseq = $ins . substr($refseq, $coords1[0]-1, $coords0[1]-$coords1[0]+1);
-    return( ".\t.\t.\t.\t.\t.\t.\t" );
+    return("13\t" . ($refend-$inspos) . "\t" . $keyc . "\t" . $ref . "\t" . $alt . "\t.\t." );
 }
 
 ####################################################################
@@ -1446,7 +1478,7 @@ sub proc_vcf_from_keyfull {
 ####################################################################
 ####################################################################
 
-my $fbase; my $outname;
+my $fbase; my $outname; my %umitags = (); my %umisWt = (); my %umisMut = ();
 if( length($inbam) > 0 ) {
   @line_cells = split(/\//, $inbam);
   $outname = $line_cells[scalar(@line_cells)-1]; $outname =~ s/\.bam$//; $outname .= "_FLT3";
@@ -1454,21 +1486,94 @@ if( length($inbam) > 0 ) {
   $fastq1 = $fbase . ".R1.fastq";
   $fastq2 = $fbase . ".R2.fastq";
 
+  if( $typeb eq "targeted" || $typeb eq "loose" ) {
+    # get chr13 name from bam file
+    if( system( sprintf( "%s view -H %s | grep 'SN:chr13\\|SN:13' > %s_header_chr13.txt", $samcmd, $inbam, $fbase ) ) ) {
+      die "Failed to extract header from original input bam. Exiting...\n";
+    }
+    open(FI, $fbase . "_header_chr13.txt" ) or die $!;
+    while(<FI>) { if($_ =~ /SN:(\w+)/) { $targetregion = $1 . ":" . $refstart .  "-" . $refend; } }
+    close FI;
+    if( system( sprintf( "rm %s_header_chr13.txt", $fbase )) ) {
+      die "Failed to remove header chr13 file. Exiting...\n";
+    }
+  }
+
   if( $typeb eq "targeted" ) {
     # Extract alignments to the FLT3 target locus from the input bamfile
     # This is assumed to include all mutant reads (which should be true if a local aligner was used)
-    if( system( sprintf( "%s view -b -F 0x900 %s 13:28607438-28608937 > %s.bam", $samcmd, $inbam, $fbase ) ) ||
+    if( system( sprintf( "%s view -b -F 0x900 %s %s > %s.bam", $samcmd, $inbam, $targetregion, $fbase ) ) ||
         system( sprintf( "%s index %s.bam", $samcmd, $fbase ) ) ||
         system( sprintf( "%s sort -n %s.bam -o %s.sorted.bam", $samcmd, $fbase, $fbase ) ) ) {
       die "Failed to extract existing FLT3 targeted locus alignments from original input bam. Exiting...\n";
+    }
+    if( system( sprintf( "rm %s.bam", $fbase )) ||
+ 	system( sprintf( "rm %s.bam.bai", $fbase )) ) {
+      die "Failed to remove presorted target bam files. Exiting...\n";
+    }
+  } elsif( $typeb eq "loose" ) {
+    # Extract alignments to the FLT3 target locus from the input bamfile
+    print "Extracting FLT3 target locus...\n";
+    if( system( sprintf( "%s view -b -F 0x900 %s %s > %s.bam", $samcmd, $inbam, $targetregion, $fbase ) ) ||
+        system( sprintf( "%s index %s.bam", $samcmd, $fbase ) ) ) {
+      die "Failed to extract existing FLT3 targeted locus alignments from original input bam. Exiting...\n";
+    }
+
+    # Extract unmapped alignments from the input bamfile
+    print "Extracting unmapped reads...\n";
+    if( system( sprintf( "%s view -bf 4 -F 0x900 %s > %s_unmapped.bam", $samcmd, $inbam, $fbase ) ) ||
+	system( sprintf( "%s index %s_unmapped.bam", $samcmd, $fbase ) ) ) {
+      die "Failed to extract unmapped alignments from original input bam. Exiting...\n";
+    }
+
+    # Merge target and unmapped files
+    print "Merging FLT3 target locus and unmapped bams...\n";
+    if( system( sprintf( "%s merge %s_merged.bam %s.bam %s_unmapped.bam", $samcmd, $fbase, $fbase, $fbase ) ) ) {
+	die "Failed to merge target and unmapped files. Exiting...\n";
+    }
+
+    # Index and sort merged file
+    if( system( sprintf( "%s index %s_merged.bam", $samcmd, $fbase ) ) ||
+	system( sprintf( "%s sort -n %s_merged.bam -o %s.sorted.bam", $samcmd, $fbase, $fbase ) ) ) {
+      die "Failed to extract existing FLT3 targeted locus alignments from original input bam. Exiting...\n";
+    }
+
+    # Remove presorted files
+    if( system( sprintf( "rm %s.bam", $fbase )) ||
+ 	system( sprintf( "rm %s.bam.bai", $fbase )) ||
+	system( sprintf( "rm %s_unmapped.bam", $fbase )) ||
+ 	system( sprintf( "rm %s_unmapped.bam.bai", $fbase )) ||
+	system( sprintf( "rm %s_merged.bam", $fbase )) ||
+ 	system( sprintf( "rm %s_merged.bam.bai", $fbase )) ) {
+      die "Failed to remove presorted bam files. Exiting...\n";
     }
   } elsif( $typeb eq "all" ) {
     if( system( sprintf( "%s sort -n %s -o %s.sorted.bam", $samcmd, $inbam, $fbase ) ) ) {
       die "Failed to sort original input bam by readnames. Exiting...\n";
     }
   } else {
-      print "ERROR: typeb must either equal \"targeted\" or \"all\"...";
+      print "ERROR: typeb must either equal \"targeted\", \"loose\", or \"all\"...";
       HelpMessage(1);
+  }
+
+  if( $umitag ne "" ) {
+    if( system( sprintf( "%s view %s.sorted.bam > %s.sorted.sam", 
+	$samcmd, $fbase, $fbase ) ) ) {
+      die "Failed to create sam file for extracting umi tags";
+    }
+
+    open( FI, $fbase . ".sorted.sam" ) or die $!;
+    while(<FI>) {
+      chomp;
+      @line_cells = split( /\t/, $_ );
+      if( /${umitag}(\S+)/ && !exists( $umitags{$line_cells[0]} ) ) {
+        $umitags{$line_cells[0]} = $umitag . $1;
+      }
+    }
+    close FI;
+    if( system( sprintf( "rm %s.sorted.sam", $fbase )) ) {
+      die "Failed to remove sam file for extracting umi tags";
+    }
   }
 
   if( system( sprintf( "%s -i %s.sorted.bam -fq %s -fq2 %s", 
@@ -1476,12 +1581,9 @@ if( length($inbam) > 0 ) {
     die "Failed to convert bamfile to fastq file. Exiting...\n";
   }
 
-  if( system( sprintf( "rm %s.bam", $fbase )) ||
-      system( sprintf( "rm %s.bam.bai", $fbase )) ||
-      system( sprintf( "rm %s.sorted.bam", $fbase )) ) {
+  if( system( sprintf( "rm %s.sorted.bam", $fbase )) ) {
     die "Failed to remove intermediate bam files. Exiting...\n";
   }
-
 } else {
   @line_cells = split(/\//, $fastq1 );
   $outname = $line_cells[scalar(@line_cells)-1];
@@ -1491,32 +1593,46 @@ if( length($inbam) > 0 ) {
   $fbase = $outpath . "/" . $outname;
 }
 
-my $shortkey = $outname; $shortkey =~ s/\.consensus//; $shortkey =~ s/\.filtered\_FLT3//; $shortkey =~ s/\.mapped\_FLT3//;
+my $shortkey = $outname; $shortkey =~ s/\.consensus//; $shortkey =~ s/\.raw//; 
+$shortkey =~ s/\.filtered\_FLT3//; $shortkey =~ s/\.mapped\_FLT3//; $shortkey =~ s/\.aligned_FLT3//;
 
 # clean up old files
 if( glob($fbase . "*.html") ) { system( "rm " . $fbase . "*.html" ); }
 if( glob($fbase . "*.vcf") ) { system( "rm " . $fbase . "*.vcf" ); }
-if( glob($fbase . "*.fastq.gz") ) { system( "rm " . $fbase . "*.fastq.gz" ); }
+if( glob($fbase . "*summary.txt") ) { system( "rm " . $fbase . "*summary.txt" ); }
+
+if( $adapter ) {
+  my $trimfq1 = $fastq1; $trimfq1 =~ s/\.R1\.fastq/\.trimmed\.R1\.fastq/;
+  my $trimfq2 = $fastq2; $trimfq2 =~ s/\.R2\.fastq/\.trimmed\.R2\.fastq/;
+  if(
+      system( sprintf( "%s -Xmx2g in1=%s in2=%s out1=%s out2=%s literal='AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC,AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT' ktrim=r k=23 hdist=1 mink=11 hdist=1 ordered=t ignorebadquality", $trimcmd, $fastq1, $fastq2, $trimfq1, $trimfq2 ) ) ||
+      system( sprintf( "mv %s %s", $trimfq1, $fastq1 ) ) ||
+      system( sprintf( "mv %s %s", $trimfq2, $fastq2 ) ) ) {
+    die "Failed to trim adapters. Exiting...\n";
+  }
+}
 
 # Local alignments to reference
 if( $proc_index && system( sprintf( "%s index -p %s %s", $bwacmd, $refindex, $reffasta ) ) ) {
   die "Failed to create bwa index for reference.  Exiting...\n" ;
 }
 
-if( system( sprintf( "%s mem -k %s -M -O 6 -T %s %s %s %s > %s_%s.sam", 
+if( system( sprintf( "%s mem -k %s -M -O 6 -T %s %s %s %s | grep FLT3_dna_e14e15 > %s_%s.sam", 
 	$bwacmd, $bwaSeedLength, $bwaThreshold, $refindex, $fastq1, $fastq2, $fbase, $alignerLocal ) ) ) {
   die "Failed to locally align initial reads to targeted FLT3 locus. Exiting...\n";
 }
 
-my %endsFwdR2 = (); my %endsRevR2 = ();
 my $readsuffix; my $str; # strand
+my %endsFwdR2 = (); my %endsRevR2 = ();
 my %psam = (); my %ssam = (); my %pseq = (); my %pqa = (); my %pstr = (); my %spos = ();
 my %pcig = (); my %scig = (); my %ploc = (); my %sloc = (); my %sstr = (); my %ppos = ();
-my %resolvedWt = (); my %resolvedWtPaired = (); my %pbase = ();
+my %resolvedWt = (); my %resolvedWtPaired = (); my %readsPassed = (); my %pbase = (); 
 open( FI, $fbase . "_" . $alignerLocal . ".sam" ) or die $!;
 while(<FI>){
     if( !/^@/ ) {
 	@line_cells = split( /\t/, $_ );
+
+	if( $line_cells[2] eq "*" ) { next; }
 
 	if( ( $line_cells[1] & 64 ) == 64 ) {
 	    $readsuffix = "_1";
@@ -1525,10 +1641,12 @@ while(<FI>){
 	} else {
 	    next;
 	}
-
 	$readname = $line_cells[0] . $readsuffix;
-	my $rpos = $line_cells[3]-1;
+
 	$cigar = $line_cells[5];
+	if( $cigar =~ /^(\d+)H(.*)H$/ ) { next; }
+	$readlengths{length( $line_cells[9] )} += 1;
+	my $rpos = $line_cells[3]-1; 
 	while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
 	    $cigar = $3;
 	    if( $2 eq "M" || $2 eq "N" || $2 eq "D" ) { $rpos += $1; }
@@ -1617,38 +1735,74 @@ foreach my $read (keys %resolvedWt) {
     $read =~ s/\_1$//g; $read =~ s/\_2$//g;
     if( exists($resolvedWt{$read."_1"}) && exists($resolvedWt{$read."_2"}) && $pstr{$read."_1"} ne $pstr{$read."_2"} ) {
 	$resolvedWtPaired{$read} = 1;
+	$readsPassed{$read} = 1;
     }
+}
+
+if( $umitag ne "" ) {
+  open( FO, ">" . $fbase . "_wt.sam" ) or die $!;
+  foreach( sort keys %resolvedWtPaired ) {
+    my $sam = $psam{$_ . "_1"}; chomp( $sam );
+    print FO $sam;
+    if( exists( $umitags{$_} ) ) { print FO "\tMQ:i:60\t" . $umitags{$_}; }
+    print FO  "\n";
+    $sam = $psam{$_ . "_2"}; chomp( $sam );
+    print FO $sam;
+    if( exists( $umitags{$_}  ) ) { print FO  "\tMQ:i:60\t" . $umitags{$_}; }
+    print FO "\n";
+  }
+  close FO;
+
+  if( system( sprintf( "%s view -bT %s %s_wt.sam | %s sort -n -o %s_wt.bam", 
+	$samcmd, $reffasta, $fbase, $samcmd, $fbase ) ) ) {
+    die "Failed to convert wt sam to bam. Exiting...\n";
+  }
+
+  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_wt.bam -o %s_wt_umigroups.bam -s adjacency -f %s_wt_umisizes.txt", 
+	$javacmd, $fgbiojar, $fbase, $fbase, $fbase ) ) ) {
+    die "Failed to perform fgbio GroupReadsByUmi on wildtype reads...\n";
+  }
+
+  if( system( sprintf( "%s view %s_wt_umigroups.bam > %s_wt_umigroups.sam", 
+	$samcmd, $fbase, $fbase ) ) ) {
+    die "Failed to convert wt umigroups bam to sam...\n";
+  }
+
+  open( FI, $fbase . "_wt_umigroups.sam" ) or die $!;
+  while(<FI>) {
+    @line_cells = split(/\t/, $_);
+    if( $_ =~ /MI:Z:(\d+)/ ) { $umisWt{$line_cells[0]} = $1; }
+  }
+
+  if( !$debug && (
+    system( sprintf( "rm %s_wt_umisizes.txt", $fbase ) ) ||
+    system( sprintf( "rm %s_wt_umigroups.sam", $fbase ) ) ||
+    system( sprintf( "rm %s_wt_umigroups.bam", $fbase ) ) ) ) {
+    die "Failed to remove wt umigroups bam...\n"; 
+  }
+
+  if( !$debug && system( sprintf( "rm %s_wt.*", $fbase ) ) ) { die "Failed to remove wt alignment files...\n"; }
 }
 
 my $entryFA = "";
 open(FO1, ">" . $fbase . ".nowt.R1.fastq" ) or die $!;
 open(FO2, ">" . $fbase . ".nowt.R2.fastq" ) or die $!;
-if( $archive ) {
-  open(FO3, ">" . $fbase . "_" . $alignerLocal . ".R1.fastq" ) or die $!; 
-  open(FO4, ">" . $fbase . "_" . $alignerLocal . ".R2.fastq" ) or die $!; 
-}
-foreach my $read (keys %pbase ) {
+foreach my $read (sort keys %pbase ) {
     if( exists($psam{$read . "_1"}) && exists($psam{$read . "_2"}) ) {
 	@line_cells = split(/\t/, $psam{$read . "_1"});
 	$seq = $line_cells[9]; $qa = $line_cells[10];
        	if( ($line_cells[1] & 16) == 16 ) { $seq = reverse $seq; $seq =~ tr/ATGCatgc/TACGtacg/; $qa = reverse $qa; }
 	$entryFA = "@" . $read . "/1\n" . $seq . "\n" . "+" . "\n" . $qa . "\n";
         if( !exists($resolvedWtPaired{$read}) ) { print FO1 $entryFA; }
-	if( $archive ) { print FO3 $entryFA; }
 	@line_cells = split(/\t/, $psam{$read . "_2"});
 	$seq = $line_cells[9]; $qa = $line_cells[10];
        	if( ($line_cells[1] & 16) == 16 ) { $seq = reverse $seq; $seq =~ tr/ATGCatgc/TACGtacg/; $qa = reverse $qa; }	
 	$entryFA = "@" . $read . "/2\n" . $seq . "\n" . "+" . "\n" . $qa . "\n";
 	if( !exists($resolvedWtPaired{$read}) ) { print FO2 $entryFA; }
-	if( $archive ) { print FO4 $entryFA; }
     }
 }
 close FO1;
 close FO2;
-if( $archive ) { close FO3; close FO4; }
-if( $archive && system( "gzip -f " . $fbase . "_" . $alignerLocal . ".*.fastq" ) ) {
-  die "Error gzipping archive fastqs. Exiting...";
-}
 
 if( scalar( keys %clipsfastq ) > 0 ) {
   open (FO, ">" . $fbase . "_clips.fastq" ) or die $!;
@@ -1752,19 +1906,13 @@ if( scalar( keys %clipsfastq ) > 0 ) {
   }
 }
 
-open( FO, ">" . $fbase . "_dets_extseqs.txt" ) or die $! ;
 foreach my $read ( keys %lloc ) {
   my $itdsize = length($pseq{$read}) - $rloc{$read} + $lloc{$read};
   if( $itdsize > 0 && $itdsize <= $maxITDsize ) {
     my $extSeq = substr($refseq,0,$lloc{$read}) . $pseq{$read} . substr($refseq,$rloc{$read});
     $extByLength{$itdsize} += 1;
     $extBySeq{$itdsize}{$extSeq} += 1;
-    print FO $itdsize . "_" . $lloc{$read} . "_" . $rloc{$read} . "\t" . $read . "\t" . $pcig{$read} . "\t" . $pseq{$read} . "\t" . $extSeq . "\n";
   }
-}
-close FO;
-if( !$debug && system( "rm " . $fbase . "_dets_extseqs.txt" ) ) {
-  die "Error removing dets_extseqs file (details on extended reads). Exiting...";
 }
 
 my %sumaHash = (); my $sumaclust = ""; my %extsizeHash = (); my %extpreHash = ();
@@ -1895,13 +2043,14 @@ while(<FI>) {
 close FI;
 
 if( !$debug && (
-    system( "rm " . $fbase . "_sumaclust.fasta" ) ||
     system( "rm " . $fbase . "_for_sumaclust.fasta" ) ||
     system( "rm " . $fbase . "_sumaclust.clusters" ) ||
     system( "rm " . $fbase . "_candidate_clusters.fa" ) ||
     system( "rm " . $fbase . "_candidate_clusters_" . $alignerExts . ".sam" ) ) ) {
     die "Error removing candidate_cluster and sumaclust files. Exiting...";
 }
+
+if( !$debug ) { system( "rm " . $fbase . "_sumaclust.fasta" ); } # File may not exist if sumaclust fails
 
 open (FO, ">" . $fbase . "_candidate_clusters_middle.fa") or die $!;
 foreach( keys %adets ) {
@@ -2074,6 +2223,12 @@ foreach my $size ( keys %svkeysByBinTot ) {
 		$itdkeysfiltered{ $sub_cells[0] } = 1;
 	    }
 	    close FI;
+
+	    if( !$debug && (
+		system( "rm " . $fbase . "_sumaclust_len" . $size . ".*" ) ||
+		system( "rm " . $fbase . "_for_sumaclust_len" . $size . ".fasta" ) ) ) {
+		die "Error removing binned sumaclust files. Exiting...";
+	    } 
 	}
     } else {
 	@line_cells = keys %{$svkeysByBin{$size}};
@@ -2090,54 +2245,48 @@ if( scalar( keys %itdkeysfiltered ) == 0 ) {
         ( $inbam ne "" && system( "rm " . $fbase . ".R*.fastq" ) ) ) ) {
       die "Error removing fastq files. Exiting...";
     }
-    exit(0);
 }
 
-open(FO, ">" . $fbase . "_candidate_ITDs.fa" ) or die $!;
-foreach( sort keys %itdkeysfiltered ) { print FO ">" . $_ . "\n" . $sumaHash{$_} . "\n"; }
-close FO;
 
-# Build bwa candidates index and perform bwa-mem against candidates
-if ( system( sprintf( "%s index -p %s_candidate_ITDs %s_candidate_ITDs.fa", $bwacmd, $fbase, $fbase ) ) ||
-     system( sprintf( "%s mem -M -O 6 -T 20 %s_candidate_ITDs %s.nowt.R1.fastq %s.nowt.R2.fastq > %s_to_candidate_ITDs_%s.sam", 
-		 $bwacmd, $fbase, $fbase, $fbase, $fbase, $alignerToITDs ) ) ) {
-  die "Error aligning reads against ITD candidates. Exiting...";
-}
+# ITERATE THROUGH ITD CANDIDATES TO PRECLUDE MIXED PAIRS
+# E.G. COULD ALTERNATIVELY USE BOWTIE2, WHICH HAS NO-DISCORDANT FLAG
+my $itdN = 0; my $headerMut = "";
+my %resolvedMutPaired = (); my %psamMut = (); my %rposMut = ();
+foreach my $itd ( sort {$extpreHash{$b} <=> $extpreHash{$a} } keys %itdkeysfiltered ) {
+  $itdN++;
+  open(FO, ">" . $fbase . "_candidate_ITD_" . $itdN . ".fa" ) or die $!;
+  print FO ">" . $itd . "\n" . $sumaHash{$itd} . "\n"; 
+  close FO;
 
-if( !$debug && ( system( "rm " . $fbase . ".nowt.R*.fastq" ) || 
-    ( $inbam ne "" && system( "rm " . $fbase . ".R*.fastq" ) ) ) ) {
-  die "Error removing fastq files. Exiting...";
-}
+  # Build bwa candidates index and perform bwa-mem against candidates
+  if ( system( sprintf( "%s index -p %s_candidate_ITD_%s %s_candidate_ITD_%s.fa", $bwacmd, $fbase, $itdN, $fbase, $itdN ) ) ||
+       system( sprintf( "%s mem -M -O 6 -T 20 %s_candidate_ITD_%s %s.nowt.R1.fastq %s.nowt.R2.fastq > %s_to_candidate_ITD_%s_%s.sam", 
+		 $bwacmd, $fbase, $itdN, $fbase, $fbase, $fbase, $itdN, $alignerToITDs ) ) ) {
+    die "Error aligning reads against ITD candidates. Exiting...";
+  }
 
-# Filter out suboptimal alignments to candidate clusters
-my $header = "";
-my %filterFlag;
-my %alignmentsFwd = (); my %alignmentsRev = ();
-my %regionsFwd = (); my %regionsRev = ();
-my %strandsFwd = (); my %strandsRev = ();
-open (FI, $fbase . "_to_candidate_ITDs_" . $alignerToITDs . ".sam" ) or die $!;
-while(<FI>) {
+  my %resolvedMut = (); my %resolvedMutMJ = (); my %strMut = ();
+  open (FI, $fbase . "_to_candidate_ITD_" . $itdN . "_" . $alignerToITDs . ".sam" ) or die $!;
+  while(<FI>) {
     if( /^@/ ) {
-	$header .= $_;
+	if( /^\@SQ/ ) { $headerMut .= $_ };
     } else {
+	chomp;
 	@line_cells = split( /\t/, $_ );
-	$readname = $line_cells[0];
-	$filterFlag{$readname} += 0;
-	my $str = "+";
-	if( ($line_cells[1] & 16) == 16 ) { $str = "-"; }
-	if( ($line_cells[1] & 64) == 64 ) {
-	    $alignmentsFwd{$readname} = $_;
-	    $regionsFwd{$readname} = $line_cells[2];
-	    $strandsFwd{$readname} = $str;
-	} elsif( ($line_cells[1] & 128) == 128 ) {
-	    $alignmentsRev{$readname} = $_;
-	    $regionsRev{$readname} = $line_cells[2];
-	    $strandsRev{$readname} = $str;
+	if( exists( $resolvedMutPaired{$line_cells[0]} ) || $line_cells[2] eq "*" ||
+	    ( $line_cells[1] & 256 ) == 256 || ( $line_cells[1] & 2048 ) == 2048 ) {
+	  next; 
+	}
+	if( ( $line_cells[1] & 64 ) == 64 ) {
+	    $readsuffix = "_1";
+	} elsif( ( $line_cells[1] & 128 ) == 128 ) {
+	    $readsuffix = "_2";
 	} else {
-	    print( "******** UNEXPECTED ALIGNMENT: NOT A PAIRED READ? ********** \n" );
+	    next;
 	}
 
-	$cigar = $line_cells[5];
+	$readname = $line_cells[0] . $readsuffix;
+        $cigar = $line_cells[5];
 	my $clipLen = 0;
 	my $insLen = 0;
 	my $delLen = 0;
@@ -2145,188 +2294,735 @@ while(<FI>) {
 	if( @a = $cigar =~ /(\d+)I/g ) { foreach my $x (@a) { $insLen += $x; } }
 	if( @a = $cigar =~ /(\d+)D/g ) { foreach my $x (@a) { $delLen += $x; } }
 
-	if( $insLen > $maxInsAllowed || $delLen > $maxDelAllowed || $clipLen > $maxClipAllowed ||
-	    ($_ =~ /NM:i:(\d+)/ && $1 > $maxEditDist) ) {
-	    $filterFlag{$readname} += 1;
-	}
+	if( $insLen <= $maxInsAllowed && $delLen <= $maxDelAllowed && $clipLen <= $maxClipAllowed && 
+		 ($_ =~ /NM:i:(\d+)/ && $1 <= $maxEditDist) ) {
+	  my $rpos = $line_cells[3]-1;
+	  while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
+	    $cigar = $3;
+	    if( $2 eq "M" || $2 eq "N" || $2 eq "D" ) { $rpos += $1; }
+	  }
+	  $resolvedMut{$readname} = 1;  # reads aligning "stringently" to itd genome 
+	  $psamMut{$readname} = $_;
+	  $rposMut{$readname} = $rpos;
+	  if( ( $line_cells[1] & 16 ) == 16 ) {
+	    $strMut{$readname} = "-";
+	  } else {
+	    $strMut{$readname} = "+";
+	  }
+	  if( ( $candidatedets{$itd}{mutbk_s0} >= $line_cells[3]+$buffer &&
+		$candidatedets{$itd}{mutbk_s0} < $rpos-$buffer ) ||
+    	      ( $candidatedets{$itd}{mutbk_s1} > $line_cells[3]+$buffer && 
+		$candidatedets{$itd}{mutbk_s1} <= $rpos-$buffer ) ) {
+	    $resolvedMutMJ{$readname} = 1;
+	  }
+        }
     }
-}
-close FI;
+  }
+  close FI;
 
-if( !$debug && (
-    system( "rm " . $fbase . "_candidate_ITDs.*" ) ||
-    system( "rm " . $fbase . "_to_candidate_ITDs_" . $alignerToITDs . ".sam" ) ) ) {
-  die "Error removing candidate_ITDs fasta and alignment files. Exiting...";
+  foreach my $read (keys %resolvedMut) {
+    $read =~ s/\_1$//g; $read =~ s/\_2$//g;
+    if( exists($resolvedMut{$read."_1"}) && exists($resolvedMut{$read."_2"}) &&
+	$strMut{$read."_1"} ne $strMut{$read."_2"} && 
+        ($resolvedMutMJ{$read."_1"} || $resolvedMutMJ{$read."_2"} ) ) {
+	$resolvedMutPaired{$read} = 1;
+	$readsPassed{$read} = 1;
+    }
+  }
+
+  if( !$debug && (
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".fa" ) ||
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".amb" ) ||
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".ann" ) ||
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".bwt" ) ||
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".pac" ) ||
+    system( "rm " . $fbase . "_candidate_ITD_" . $itdN . ".sa" ) ||
+    system( "rm " . $fbase . "_to_candidate_ITD_" . $itdN . "_" . $alignerToITDs . ".sam" ) ) ) {
+    die "Error removing candidate_ITDs fasta, index, and alignment files. Exiting...";
+  }
 }
 
-my %candidateReads;
-my %candidateReadsAll;
+if( !$debug && ( system( "rm " . $fbase . ".nowt.R*.fastq" ) || 
+  ( $inbam ne "" && system( "rm " . $fbase . ".R*.fastq" ) ) ) ) {
+  die "Error removing fastq files. Exiting...";
+}
+
 open (FO, ">" . $fbase . "_to_candidate_ITDs.filtered.sam" ) or die $!;
-print FO $header;
-foreach( keys %filterFlag) {
-    if( $filterFlag{$_} == 0 && $regionsFwd{$_} eq $regionsRev{$_} && $strandsFwd{$_} ne $strandsRev{$_} ) {
-	print FO $alignmentsFwd{$_};
-	print FO $alignmentsRev{$_};
-	@line_cells = split(/\t/, $alignmentsFwd{$_});
-	$candidateReads{$line_cells[2]}+=1;
-	$candidateReadsAll{$line_cells[2]}{$_} = 1;
-    }
+print FO $headerMut;
+foreach( sort keys %resolvedMutPaired ) {
+    print FO $psamMut{$_."_1"};
+    if( exists( $umitags{$_}) ) { print FO "\tMQ:i:60\t" . $umitags{$_}; } 
+    print FO "\n";
+    print FO $psamMut{$_."_2"};
+    if( exists( $umitags{$_}) ) { print FO "\tMQ:i:60\t" . $umitags{$_}; }
+    print FO "\n";
 }
 close FO;
 
+if( $umitag ne "" ) {
+  if( system( sprintf( "%s view -bS %s_to_candidate_ITDs.filtered.sam | %s sort -n -o %s_mut.bam", $samcmd, $fbase, $samcmd, $fbase ) ) ) {
+    die "Failed to convert mutant sam to bam. Exiting...\n";
+  }
+
+  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_mut.bam -o %s_mut_umigroups.bam -s Adjacency -f %s_mut_umisizes.txt -m 0", $javacmd, $fgbiojar, $fbase, $fbase, $fbase ) ) ) {
+    die "Failed to perform fgbio GroupReadsByUmi on mutant reads...\n";
+  }
+
+  if( system( sprintf ( "%s view %s_mut_umigroups.bam > %s_mut_umigroups.sam",
+    $samcmd, $fbase, $fbase ) ) ) {
+    die "Failed to convert mut umigroups bam to sam...\n";
+  }
+
+  open( FI, $fbase . "_mut_umigroups.sam" ) or die $!;
+  while(<FI>) {
+    @line_cells = split(/\t/, $_);
+    if( $_ =~ /MI:Z:(\d+)/ ) { $umisMut{$line_cells[0]} = $1; }
+  }
+
+  if( !$debug &&
+      ( system( sprintf( "rm %s_mut.bam", $fbase ) ) || 
+        system( sprintf( "rm %s_mut_umisizes.txt", $fbase ) ) ||
+        system( sprintf( "rm %s_mut_umigroups.sam", $fbase ) ) ||
+        system( sprintf( "rm %s_mut_umigroups.bam", $fbase ) ) ) ) {
+    die "Failed to remove mutant bam file...\n";
+  }
+}
+
 my %readsMut = (); my %readsMutLeft = (); my %readsMutRight = ();
 my %readsMutWt = (); my %readsMutWtLeft = (); my %readsMutWtRight = ();
+my %readsMutMut = (); my %readsMutMutLeft = (); my %readsMutMutRight = ();
 my %readsWt = (); my %readsWtLeft = (); my %readsWtRight = ();
 my %coverageMut = (); my %coverageMutLeft = (); my %coverageMutRight = (); 
 my %coverageMutWt = (); my %coverageMutWtLeft = (); my %coverageMutWtRight = (); 
 my %coverageWt = ();  my %coverageWtLeft = ();  my %coverageWtRight = (); 
-my %readsPassed = ();
+my %readsMutByR2 = (); my %readsWtByR2 = (); 
 
-# FUTURE USE
-my %readsMutByPrimerR2 = (); my %readsWtByPrimerR2 = ();
-my %readsMutByR2 = (); my %readsWtByR2 = (); my %allreadsWtByR2 = (); 
-my %locFwd0 = (); my %locFwd1 = (); my %locRev0 = (); my %locRev1 = ();
-# END FUTURE USE
+my %umisMutLeft = (); my %umisMutRight = (); my %umisMutAll = ();
+my %umisMutWtLeft = (); my %umisMutWtRight = ();
+my %umisMutMutLeft = (); my %umisMutMutRight = (); my %umisMutMutAll= ();
+my %umisWtLeft = (); my %umisWtRight = (); my %umisWtAll = ();
+my %covUmisWtLeft = (); my %covUmisWtRight = (); my %covUmisWt = ();
+my %covUmisMutLeft = (); my %covUmisMutRight = (); my %covUmisMut = ();
+my %covUmisMutWtLeft = (); my %covUmisMutWtRight = ();
+my $lposAdj; my $rposAdj;
 
 open( FI, $fbase . "_to_candidate_ITDs.filtered.sam" ) or die $!;
 while(<FI>) {
     if( /^@/ ) { next; }
     @line_cells = split( /\t/, $_ );
-    if( $line_cells[2] eq "*" || ( $line_cells[1] & 256 ) == 256 || ( $line_cells[1] & 2048 ) == 2048 ) { next; }
 
-    my $cname = $line_cells[2];
-    my $rpos = $line_cells[3]-1;
     $readname = $line_cells[0];
-    $cigar = $line_cells[5];
-    while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
-	$cigar = $3;
-	if( $2 eq "M" || $2 eq "N" || $2 eq "D" ) { $rpos += $1; }
+    my $cname = $line_cells[2];
+    my $rpos=0;
+    if( ( $line_cells[1] & 64 ) == 64 ) {
+      $rpos = $rposMut{$readname."_1"};
+    } elsif( ( $line_cells[1] & 128 ) == 128 ) {
+      $rpos = $rposMut{$readname."_2"};
+    } else {
+      next;
     }
-    if( !exists($readsMutLeft{$cname}{$readname}) &&
-	$candidatedets{$cname}{mutbk_s0} >= $line_cells[3]+$buffer && 
+ 
+    # ADD LOGIC FOR NOBIND CASES (ALLOW RELAXED BUFFER?)
+
+    if( $candidatedets{$cname}{mutbk_s0} >= $line_cells[3]+$buffer && 
 	$candidatedets{$cname}{mutbk_s0} < $rpos-$buffer ) {
+      if( ( $line_cells[1] & 128 ) == 128 ) { $readsMutByR2{$cname}{$readname} = 1; }
+      if( !exists($readsMutLeft{$cname}{$readname}) ) {
 	$readsMutLeft{$cname}{$readname} = 1;
 	$readsMut{$cname}{$readname} = 1;
-	$readsPassed{$readname} = 1;
+	if( exists($umisMut{$readname}) ) { 
+	  $umisMutLeft{$cname}{$umisMut{$readname}} = 1;
+	  $umisMutAll{$cname}{$umisMut{$readname}} = 1;
+	} else {
+	  $umisMutLeft{$cname}{other} = 1;
+	  $umisMutAll{$cname}{other} = 1;
+	}
+      }
     }
-    if( !exists($readsMutRight{$cname}{$readname}) &&
-	$candidatedets{$cname}{mutbk_s1} > $line_cells[3]+$buffer && 
+    if( $candidatedets{$cname}{mutbk_s1} > $line_cells[3]+$buffer && 
 	$candidatedets{$cname}{mutbk_s1} <= $rpos-$buffer ) {
+      if( ( $line_cells[1] & 128 ) == 128 ) { $readsMutByR2{$cname}{$readname} = 1; }
+      if( !exists($readsMutRight{$cname}{$readname}) ) {
 	$readsMutRight{$cname}{$readname} = 1;
 	$readsMut{$cname}{$readname} = 1;
-	$readsPassed{$readname} = 1;
+	if( exists($umisMut{$readname}) ) {
+	  $umisMutRight{$cname}{$umisMut{$readname}} = 1;
+	  $umisMutAll{$cname}{$umisMut{$readname}} = 1;
+	} else {
+	  $umisMutRight{$cname}{other} = 1;
+	  $umisMutAll{$cname}{other} = 1;
+	}
+      }
     }
     if( !exists($readsMutWtLeft{$cname}{$readname}) && 
 	$candidatedets{$cname}{dup_r0} > $line_cells[3]+$buffer && 
 	$candidatedets{$cname}{dup_r0} <= $rpos-$buffer ) {
 	$readsMutWtLeft{$cname}{$readname} = 1;
 	$readsMutWt{$cname}{$readname} = 1;
-	$readsPassed{$readname} = 1;
+	if( exists($umisMut{$readname}) ) {
+	  $umisMutWtLeft{$cname}{$umisMut{$readname}} = 1;
+	} else {
+	  $umisMutWtLeft{$cname}{other} = 1;
+	}
     }
     if( !exists($readsMutWtRight{$cname}{$readname}) && 
 	$candidatedets{$cname}{dup_r1}+$candidatedets{$cname}{itdsize} >= $line_cells[3]+$buffer && 
 	$candidatedets{$cname}{dup_r1}+$candidatedets{$cname}{itdsize} < $rpos-$buffer ) {
 	$readsMutWtRight{$cname}{$readname} = 1;
 	$readsMutWt{$cname}{$readname} = 1;
-	$readsPassed{$readname} = 1;
+	if( exists($umisMut{$readname}) ) {
+	  $umisMutWtRight{$cname}{$umisMut{$readname}} = 1;
+	} else {
+	  $umisMutWtRight{$cname}{other} = 1;
+	}
     }
 
-    # FUTURE USE
-    if( 0 && ( $line_cells[1] & 64 ) == 64 ) {
-	if( ($line_cells[1] & 16) == 16 ) { 
-	    $locFwd0{$readname}=$rpos; $locFwd1{$readname}=$line_cells[3]-1;
-	} else {
-	    $locFwd0{$readname}=$line_cells[3]-1; $locFwd1{$readname}=$rpos;
-	}
-    } elsif( 0 && ( $line_cells[1] & 128 ) == 128 ) {
-	if( ($line_cells[1] & 16) == 16 ) {
-	    $locRev0{$readname}=$rpos; $locRev1{$readname}=$line_cells[3]-1;
-	    if( $candidatedets{$cname}{mutbk_s1} > $line_cells[3]+$buffer && 
-		$candidatedets{$cname}{mutbk_s1} <= $rpos-$buffer ) {
-		$readsMutByPrimerR2{$cname}{R}{$rpos}{$readname} = 1;
-		$readsMutByR2{$cname}{$readname} = 1;
-	    }
-	} else {
-	    $locRev0{$readname}=$line_cells[3]-1; $locRev1{$readname}=$rpos;
-	    if( $candidatedets{$cname}{mutbk_s0} >= $line_cells[3]+$buffer && 
-		$candidatedets{$cname}{mutbk_s0} < $rpos-$buffer ) {
-		$readsMutByPrimerR2{$cname}{L}{$line_cells[3]}{$readname} = 1;
-		$readsMutByR2{$cname}{$readname} = 1;
-	    }
-	}
+    if( $rpos <= $candidatedets{$cname}{dup_r1} ) {
+      $rposAdj = $rpos;
+      $lposAdj = $line_cells[3];
+    } elsif( $line_cells[3] >= $candidatedets{$cname}{dup_r1} ) {
+      $rposAdj = $rpos - $candidatedets{$cname}{itdsize};
+      $lposAdj = $line_cells[3] - $candidatedets{$cname}{itdsize};
+    } else {
+      $rposAdj = $candidatedets{$cname}{dup_r1};
+      $lposAdj = $candidatedets{$cname}{dup_r0};
     }
-    # END FUTURE USE
+
+    # Determine if mutant read also covers other mutant boundaries for depth purposes
+    if( exists( $readsMut{$cname}{$readname} ) ) {
+      foreach my $itd ( keys %itdkeysfiltered ) {
+	if( $itd ne $cname ) {
+          if( !exists($readsMutMutLeft{$cname}{$itd}{$readname}) && 
+	    $candidatedets{$itd}{dup_r0} > $lposAdj+$buffer && 
+	    $candidatedets{$itd}{dup_r0} <= $rposAdj-$buffer ) {
+	    $readsMutMutLeft{$cname}{$itd}{$readname} = 1;
+	    $readsMutMut{$cname}{$itd}{$readname} = 1;
+	    if( exists($umisMut{$readname}) ) {
+	      $umisMutMutLeft{$cname}{$itd}{$umisMut{$readname}} = 1;
+	      $umisMutMutAll{$cname}{$itd}{$umisMut{$readname}} = 1;
+	    } else {
+	      $umisMutMutLeft{$cname}{$itd}{other} = 1;
+	      $umisMutMutAll{$cname}{$itd}{other} = 1;
+	    }
+	  }
+	  if( !exists($readsMutMutRight{$cname}{$itd}{$readname}) &&
+	    $candidatedets{$cname}{dup_r1} >= $lposAdj+$buffer && 
+	    $candidatedets{$cname}{dup_r1} < $rposAdj-$buffer ) {
+	    $readsMutMutRight{$cname}{$itd}{$readname} = 1;
+	    $readsMutMut{$cname}{$itd}{$readname} = 1;
+	    if( exists($umisMut{$readname}) ) {
+	      $umisMutMutRight{$cname}{$itd}{$umisMut{$readname}} = 1;
+	      $umisMutMutAll{$cname}{$itd}{$umisMut{$readname}} = 1;
+	    } else {
+	      $umisMutMutRight{$cname}{$itd}{other} = 1;
+	      $umisMutMutAll{$cname}{$itd}{other} = 1;
+	    }
+	  }
+	}
+      }
+    }
 }
 close FI;
 
-foreach $readname ( keys %resolvedWtPaired ) {
-    $readsPassed{$readname} = 1;
-    foreach $readsuffix ( ( "_1", "_2" ) ) {
-	@line_cells = split( /\t/, $psam{$readname . $readsuffix} );
-	$cigar = $line_cells[5];
-	my $rpos = $line_cells[3] - 1;
-	while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
-	    $cigar = $3;
-	    if( $2 eq "M" || $2 eq "N" || $2 eq "D" ) { $rpos += $1; }
+my %baitHash = (); my $bait = ""; my @baitsAll = keys %baitHash;
+my %baitIssues = (); my %baitDists = (); my %baitsByRead = ();
+my %countsByBait = (); my %umisByBait = (); my %umisFlag = ();
+my %countsByBaitAdj = (); my %umisByBaitAdj =();
+my @lens = sort {$readlengths{$b} <=> $readlengths{$a}} keys %readlengths;
+my $readlength = $lens[0];
+if( $probes ne "" ) {
+  open( FI, $probes . ".fa" ) or die $!;
+  while(<FI>) {
+    chomp;
+    if (/\>/) {
+      $bait = substr($_,1); 
+    } else {
+      $baitHash{$bait}{seq} = $_;
+      $baitHash{$bait}{len} = length($_);
+      $i = index( $refseq, $_ );
+      if( $i >= 0 ) {
+	$baitHash{$bait}{dir} = "fwd";
+	$baitHash{$bait}{start} = $i + 1;
+	$baitHash{$bait}{end} = $i + length($_);
+      } else {
+	$seq = reverse $_; $seq =~ tr/ATGCatgc/TACGtacg/;
+	$i = index( $refseq, $seq );
+	if( $i >= 0 ) {
+	  $baitHash{$bait}{dir} = "rev";
+	  $baitHash{$bait}{start} = $i + 1;
+	  $baitHash{$bait}{end} = $i + length($_);
 	}
-
-	foreach my $cname ( keys %itdkeysfiltered ) {
-	    if( !exists( $readsWtLeft{$cname}{$readname} ) &&
-		$candidatedets{$cname}{dup_r0} > $line_cells[3]+$buffer && 
-		$candidatedets{$cname}{dup_r0} <= $rpos - $buffer ) {
-		$readsWtLeft{$cname}{$readname} = 1;
-		$readsWt{$cname}{$readname} = 1;
-	    }
-	    if( !exists( $readsWtRight{$cname}{$readname} ) &&
-		$candidatedets{$cname}{dup_r1} >= $line_cells[3]+$buffer && 
-		$candidatedets{$cname}{dup_r1} < $rpos - $buffer ) {
-		$readsWtRight{$cname}{$readname} = 1;
-		$readsWt{$cname}{$readname} = 1;
-	    }
-
-	    # FUTURE USE
-	    if( 0 && ($line_cells[1] & 128) == 128 ) {
-		if( $candidatedets{$cname}{dup_r0} > $line_cells[3]+$buffer && 
-		    $candidatedets{$cname}{dup_r0} <= $rpos - $buffer ) {
-		    if( ($line_cells[1] & 16 ) == 16 ) {
-			$readsWtByPrimerR2{$cname}{R}{$rpos}{$readname} = 1;
-			$readsWtByR2{$cname}{$readname} = 1;
-		    }
-		}
-		if( $candidatedets{$cname}{dup_r1} >= $line_cells[3]+$buffer && 
-			 $candidatedets{$cname}{dup_r1} < $rpos - $buffer ) {
-		    if( ($line_cells[1] & 16 ) == 0 ) {
-			$readsWtByPrimerR2{$cname}{L}{$line_cells[3]}{$readname} = 1;
-			$readsWtByR2{$cname}{$readname} = 1;
-		    }
-		}
-	    }
-	    # END FUTURE USE
-	}
-        # FUTURE USE
-	if( 0 && ($line_cells[1] & 128) == 128 ) {
-	    if( ($line_cells[1] & 16 ) == 16 ) {
-		$allreadsWtByR2{R}{$rpos}{$readname} = 1;
-	    } else {
-		$allreadsWtByR2{L}{$line_cells[3]}{$readname} = 1;
-	    }
-	}
-	# END FUTURE USE
+      }
     }
+  }
+  close FI;
+  @baitsAll = sort keys %baitHash; push @baitsAll, "other";
+    
+  foreach( keys %itdkeysfiltered ) {
+    foreach my $bait ( keys %baitHash ) {
+      if( $baitHash{$bait}{dir} eq "fwd" ) {
+  	  $baitDists{$_}{$bait} = ($baitHash{$bait}{len}) .
+	      "_" . ($candidatedets{$_}{dup_r0}-$baitHash{$bait}{start}) . 
+	      "_" . ($candidatedets{$_}{dup_r1}-$baitHash{$bait}{start}+1) . "bp"; 
+      } elsif( $baitHash{$bait}{dir} eq "rev" ) {
+	  $baitDists{$_}{$bait} = ($baitHash{$bait}{len}) .
+	      "_" . ($baitHash{$bait}{end}-$candidatedets{$_}{dup_r1}) . 
+	      "_" . ($baitHash{$bait}{end}-$candidatedets{$_}{dup_r0}+1) . "bp"; 
+      }
+
+      if( $candidatedets{$_}{dup_r0} <= $baitHash{$bait}{start} && 
+	  $candidatedets{$_}{dup_r1} >= $baitHash{$bait}{end} ) {
+	  $baitIssues{$_}{dupbait}{$bait} = 1;
+	  $baitDists{$_}{$bait} .= "_DB";
+      } elsif( ( $baitHash{$bait}{dir} eq "fwd" &&
+		 $candidatedets{$_}{dup_r1} < $baitHash{$bait}{end} && 
+		 $candidatedets{$_}{dup_r1} >= $baitHash{$bait}{start} ) ||
+	       ( $baitHash{$bait}{dir} eq "rev" &&
+		 $candidatedets{$_}{dup_r0} > $baitHash{$bait}{start} && 
+		 $candidatedets{$_}{dup_r0} <= $baitHash{$bait}{end} ) ) {
+	  $baitIssues{$_}{nobind}{$bait} = 1;
+	  $baitDists{$_}{$bait} .= "_NB";
+      }
+
+      if( ( $baitHash{$bait}{dir} eq "fwd" &&
+	    $candidatedets{$_}{dup_r1} >= $baitHash{$bait}{end} &&
+	    $candidatedets{$_}{dup_r1} <  $baitHash{$bait}{start}+$readlength-$buffer ) ||
+	  ( $baitHash{$bait}{dir} eq "rev" &&
+	    $candidatedets{$_}{dup_r0} <= $baitHash{$bait}{start} &&
+	    $candidatedets{$_}{dup_r0} >  $baitHash{$bait}{end}-$readlength+$buffer ) ) {
+	  $baitIssues{$_}{unambig}{$bait} = 1;  # these baits sequence through entire duplicated sequence (assming not a duplicated bait)
+	  $baitDists{$_}{$bait} .= "_RB";
+      }
+    }
+  }
+    
+  open( FO, ">" . $fbase . "_to_baits.fa" ) or die $!;
+  foreach $readname ( sort keys %readsPassed ) {
+    my $seq = $pseq{$readname . "_2"}; # uses info from alignments to reference FLT3 but should be okay
+    if( $pstr{$readname . "_2"} eq "-" ) {
+	$seq = reverse $seq; $seq =~ tr/ATGCatgc/TACGtacg/;
+    }
+    print FO ">" . $readname . "\n" . substr( $seq, 0, 49 ) . "\n";
+  }
+  close FO;
+
+  if( system( sprintf( "%s mem -k %s -M -O 6 -T %s %s %s_to_baits.fa > %s_to_baits.sam",
+		       $bwacmd, $bwaSeedLength, $bwaThreshold, $probes, $fbase, $fbase ) ) ) {
+    die "Failed to locally align to baits. Exiting...\n";
+  }
+
+  open( FI, $fbase . "_to_baits.sam" ) or die $!;
+  while(<FI>) {
+    if( /AS:i:(\d+)/ && $1 >= 40 ) {
+      @line_cells = split( /\t/, $_ );
+      $baitsByRead{$line_cells[0]} = $line_cells[2];
+    }
+  }
+
+  if( !$debug && system( "rm " . $fbase . "_to_baits.*" ) ) {
+    die "Error removing baits by read files. Exiting...";
+  }
 }
 
-foreach( keys %readsMut ) { $coverageMut{$_} = scalar( keys %{$readsMut{$_}} ); }
-foreach( keys %readsMutLeft ) { $coverageMutLeft{$_} = scalar( keys %{$readsMutLeft{$_}} ); }
-foreach( keys %readsMutRight ) { $coverageMutRight{$_} = scalar( keys %{$readsMutRight{$_}} ); }
-foreach( keys %readsMutWt ) { $coverageMutWt{$_} = scalar( keys %{$readsMutWt{$_}} ); }
-foreach( keys %readsMutWtLeft ) { $coverageMutWtLeft{$_} = scalar( keys %{$readsMutWtLeft{$_}} ); }
-foreach( keys %readsMutWtRight ) { $coverageMutWtRight{$_} = scalar( keys %{$readsMutWtRight{$_}} ); }
-foreach( keys %readsWt ) { $coverageWt{$_} = scalar( keys %{$readsWt{$_}} ); }
-foreach( keys %readsWtLeft ) { $coverageWtLeft{$_} = scalar( keys %{$readsWtLeft{$_}} ); }
-foreach( keys %readsWtRight ) { $coverageWtRight{$_} = scalar( keys %{$readsWtRight{$_}} ); }
+foreach $readname ( sort keys %resolvedWtPaired ) {
+  foreach $readsuffix ( ( "_1", "_2" ) ) {
+    @line_cells = split( /\t/, $psam{$readname . $readsuffix} );
+    $cigar = $line_cells[5];
+    my $rpos = $line_cells[3] - 1;
+    while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
+      $cigar = $3;
+      if( $2 eq "M" || $2 eq "N" || $2 eq "D" ) { $rpos += $1; }
+    }
+
+    foreach my $cname ( keys %itdkeysfiltered ) {
+      if( !exists( $readsWtLeft{$cname}{$readname} ) &&
+	  $candidatedets{$cname}{dup_r0} > $line_cells[3]+$buffer && 
+	  $candidatedets{$cname}{dup_r0} <= $rpos - $buffer ) {
+	$readsWtLeft{$cname}{$readname} = 1;
+	$readsWt{$cname}{$readname} = 1;
+	if( exists($umisWt{$readname}) ) {
+	  $umisWtLeft{$cname}{$umisWt{$readname}} = 1;
+	  $umisWtAll{$cname}{$umisWt{$readname}} = 1;
+	} else {
+	  $umisWtLeft{$cname}{other} = 1;
+	  $umisWtAll{$cname}{other} = 1;
+	}
+      }
+      if( !exists( $readsWtRight{$cname}{$readname} ) &&
+	  $candidatedets{$cname}{dup_r1} >= $line_cells[3]+$buffer && 
+	  $candidatedets{$cname}{dup_r1} < $rpos - $buffer ) {
+	$readsWtRight{$cname}{$readname} = 1;
+	$readsWt{$cname}{$readname} = 1;
+	if( exists($umisWt{$readname}) ) {
+	  $umisWtRight{$cname}{$umisWt{$readname}} = 1;
+	  $umisWtAll{$cname}{$umisWt{$readname}} = 1;
+	} else {
+	  $umisWtRight{$cname}{other} = 1;
+	  $umisWtAll{$cname}{other} = 1;
+	}
+      }
+
+      if( $probes ne "" && ($line_cells[1] & 128) == 128 && exists($baitsByRead{$readname}) ) {
+	my $bait = $baitsByRead{$readname};
+	if( exists($baitIssues{$cname}{nobind}{$bait}) ||
+	    ( exists($baitIssues{$cname}{unambig}{$bait}) &&
+	      ( length($line_cells[9]) == $readlength ||
+		( $baitHash{$bait}{dir} eq "fwd" &&
+		  #$candidatedets{$cname}{dup_r1} >= $baitHash{$bait}{end} &&
+		  $candidatedets{$cname}{dup_r1} < 
+		  $baitHash{$bait}{start}+length($line_cells[9])-$buffer ) ||
+		( $baitHash{$bait}{dir} eq "rev" &&
+		  #$candidatedets{$cname}{dup_r0} <= $baitHash{$bait}{start} &&
+		  $candidatedets{$cname}{dup_r0} >
+		  $baitHash{$bait}{end}-length($line_cells[9])+$buffer ) ) ) ) {
+	  $readsWtByR2{$cname}{$readname} = 1; 
+	} 
+      }
+    }
+  }
+}
+
+if( $probes ne "" ) {
+foreach ( keys %itdkeysfiltered ) {
+  foreach my $bait ( @baitsAll ) {
+    $countsByBait{$_}{WtLeft}{$bait} = 0; $countsByBait{$_}{WtRight}{$bait} = 0;
+    $countsByBait{$_}{MutLeft}{$bait} = 0; $countsByBait{$_}{MutRight}{$bait} = 0;
+    $countsByBait{$_}{MutWtLeft}{$bait} = 0; $countsByBait{$_}{MutWtRight}{$bait} = 0;
+    $countsByBait{$_}{MutMutLeft}{$bait} = 0; $countsByBait{$_}{MutMutRight}{$bait} = 0;
+    $countsByBait{$_}{WtR2}{$bait} = 0; $countsByBait{$_}{MutR2}{$bait} = 0; 
+    $countsByBait{$_}{Mut}{$bait} = 0; $countsByBait{$_}{All}{$bait} = 0; 
+    $umisByBait{$_}{WtLeft}{$bait} = 0; $umisByBait{$_}{WtRight}{$bait} = 0;
+    $umisByBait{$_}{MutLeft}{$bait} = 0; $umisByBait{$_}{MutRight}{$bait} = 0;
+    $umisByBait{$_}{MutWtLeft}{$bait} = 0; $umisByBait{$_}{MutWtRight}{$bait} = 0;
+    $umisByBait{$_}{MutMutLeft}{$bait} = 0; $umisByBait{$_}{MutMutRight}{$bait} = 0;
+    $umisByBait{$_}{WtR2}{$bait} = 0; $umisByBait{$_}{MutR2}{$bait} = 0; 
+    $umisByBait{$_}{Mut}{$bait} = 0; $umisByBait{$_}{All}{$bait} = 0; 
+  }
+  foreach my $read ( keys %{$readsWtLeft{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{WtLeft}{$baitsByRead{$read}} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtLeft}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtLeft}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtLeft}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{WtLeft}{other} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtLeft}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtLeft}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtLeft}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsWtRight{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{WtRight}{$baitsByRead{$read}} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtRight}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtRight}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtRight}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{WtRight}{other} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtRight}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtRight}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtRight}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsMutWtLeft{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{MutWtLeft}{$baitsByRead{$read}} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutWtLeft}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutWtLeft}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutWtLeft}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{MutWtLeft}{other} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutWtLeft}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutWtLeft}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutWtLeft}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsMutWtRight{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{MutWtRight}{$baitsByRead{$read}} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutWtRight}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutWtRight}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutWtRight}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{MutWtRight}{other} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutWtRight}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutWtRight}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutWtRight}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsMutLeft{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{MutLeft}{$baitsByRead{$read}} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutLeft}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutLeft}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutLeft}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{MutLeft}{other} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutLeft}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutLeft}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutLeft}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsMutRight{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{MutRight}{$baitsByRead{$read}} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutRight}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutRight}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutRight}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{MutRight}{other} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutRight}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutRight}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutRight}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( sort keys %{$readsWtByR2{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{WtR2}{$baitsByRead{$read}} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtR2}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtR2}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtR2}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{WtR2}{other} += 1;
+      if( exists($umisWt{$read}) ) {
+	if( !exists($umisFlag{$_}{WtR2}{$umisWt{$read}}) ) {
+	  $umisFlag{$_}{WtR2}{$umisWt{$read}} = 1;
+	  $umisByBait{$_}{WtR2}{other} += 1;
+	}
+      }
+    }
+  }
+  foreach my $read ( keys %{$readsMutByR2{$_}} ) {
+    if( exists( $baitsByRead{$read} ) ) {
+      $countsByBait{$_}{MutR2}{$baitsByRead{$read}} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutR2}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutR2}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutR2}{$baitsByRead{$read}} += 1;
+	}
+      }
+    } else {
+      $countsByBait{$_}{MutR2}{other} += 1;
+      if( exists($umisMut{$read}) ) {
+	if( !exists($umisFlag{$_}{MutR2}{$umisMut{$read}}) ) {
+	  $umisFlag{$_}{MutR2}{$umisMut{$read}} = 1;
+	  $umisByBait{$_}{MutR2}{other} += 1;
+	}
+      }
+    }
+  }
+
+  foreach my $cname ( keys %itdkeysfiltered ) {
+    if( $cname ne $_ ) { 
+      if( exists( $readsMutMutLeft{$cname}{$_} ) ) {
+	foreach my $read ( keys %{$readsMutMutLeft{$cname}{$_}} ) {
+	  if( exists( $baitsByRead{$read} ) ) {
+	    $countsByBait{$_}{MutMutLeft}{$baitsByRead{$read}} += 1;
+	    if( exists($umisMut{$read}) ) {
+	      if( !exists($umisFlag{$_}{MutMutLeft}{$umisMut{$read}}) ) {
+	        $umisFlag{$_}{MutMutLeft}{$umisMut{$read}} = 1;
+	        $umisByBait{$_}{MutMutLeft}{$baitsByRead{$read}} += 1;
+	      }
+	    }
+	  } else {
+	    $countsByBait{$_}{MutMutLeft}{other} += 1;
+	    if( exists($umisMut{$read}) ) {
+	      if( !exists($umisFlag{$_}{MutMutLeft}{$umisMut{$read}}) ) {
+	        $umisFlag{$_}{MutMutLeft}{$umisMut{$read}} = 1;
+	        $umisByBait{$_}{MutMutLeft}{other} += 1;
+	      }
+	    }
+	  }
+        }
+      }
+      if( exists( $readsMutMutRight{$cname}{$_} ) ) {
+	foreach my $read ( keys %{$readsMutMutRight{$cname}{$_}} ) {
+	  if( exists( $baitsByRead{$read} ) ) {
+	    $countsByBait{$_}{MutMutRight}{$baitsByRead{$read}} += 1;
+	    if( exists($umisMut{$read}) ) {
+	      if( !exists($umisFlag{$_}{MutMutRight}{$umisMut{$read}}) ) {
+	        $umisFlag{$_}{MutMutRight}{$umisMut{$read}} = 1;
+	        $umisByBait{$_}{MutMutRight}{$baitsByRead{$read}} += 1;
+	      }
+	    }
+	  } else {
+	    $countsByBait{$_}{MutMutRight}{other} += 1;
+	    if( exists($umisMut{$read}) ) {
+	      if( !exists($umisFlag{$_}{MutMutRight}{$umisMut{$read}}) ) {
+	        $umisFlag{$_}{MutMutRight}{$umisMut{$read}} = 1;
+	        $umisByBait{$_}{MutMutRight}{other} += 1;
+	      }
+	    }
+	  }
+        }
+      }
+    }
+  }
+
+  foreach my $bait ( @baitsAll ) {
+    $countsByBaitAdj{$_}{Mut}{$bait} = 0; $umisByBaitAdj{$_}{Mut}{$bait} = 0;
+    $countsByBaitAdj{$_}{All}{$bait} = 0; $umisByBaitAdj{$_}{All}{$bait} = 0;
+    if( exists( $baitIssues{$_}{unambig}{$bait} ) ||
+        exists( $baitIssues{$_}{nobind}{$bait} ) ) {
+      $countsByBait{$_}{Mut}{$bait} = $countsByBait{$_}{MutR2}{$bait} + 0;
+      $countsByBait{$_}{All}{$bait} = $countsByBait{$_}{MutR2}{$bait} + $countsByBait{$_}{WtR2}{$bait};
+      $umisByBait{$_}{Mut}{$bait} = $umisByBait{$_}{MutR2}{$bait} + 0;
+      $umisByBait{$_}{All}{$bait} = $umisByBait{$_}{MutR2}{$bait} + $umisByBait{$_}{WtR2}{$bait};
+      # Simple adjustment for baits with multiple potential binding positions
+      if( exists( $baitIssues{$_}{dupbait}{$bait} ) ) {
+	$countsByBaitAdj{$_}{Mut}{$bait} = $countsByBait{$_}{Mut}{$bait} + 0;
+	$umisByBaitAdj{$_}{Mut}{$bait} = $umisByBait{$_}{Mut}{$bait} + 0;
+      } elsif( exists( $baitIssues{$_}{nobind}{$bait} ) ) {
+	$countsByBaitAdj{$_}{Mut}{$bait} = -$countsByBait{$_}{Mut}{$bait} + 0;
+	$countsByBaitAdj{$_}{All}{$bait} = -$countsByBait{$_}{All}{$bait} + 0;
+	$umisByBaitAdj{$_}{Mut}{$bait} = -$umisByBait{$_}{Mut}{$bait} + 0;
+	$umisByBaitAdj{$_}{All}{$bait} = -$umisByBait{$_}{All}{$bait} + 0;
+      }
+    } else {
+      $countsByBait{$_}{Mut}{$bait} = ( $countsByBait{$_}{MutLeft}{$bait} +
+                                        $countsByBait{$_}{MutRight}{$bait} ) / 2;
+      $umisByBait{$_}{Mut}{$bait} = ( $umisByBait{$_}{MutLeft}{$bait} +
+                                      $umisByBait{$_}{MutRight}{$bait} ) / 2;
+
+      if( exists( $baitIssues{$_}{dupbait}{$bait} ) ) {
+        # for dup baits, one of WtLeft or WtRight will be 0
+        $countsByBait{$_}{All}{$bait} = ( $countsByBait{$_}{WtLeft}{$bait} +
+					  $countsByBait{$_}{WtRight}{$bait} +
+					  $countsByBait{$_}{MutLeft}{$bait} / 2 +
+                                          $countsByBait{$_}{MutRight}{$bait} / 2 ); 
+        $umisByBait{$_}{All}{$bait} = ( $umisByBait{$_}{WtLeft}{$bait} +
+				        $umisByBait{$_}{WtRight}{$bait} +
+				        $umisByBait{$_}{MutLeft}{$bait} / 2 +
+                                        $umisByBait{$_}{MutRight}{$bait} / 2 ); 
+        $countsByBaitAdj{$_}{Mut}{$bait} = $countsByBait{$_}{Mut}{$bait} + 0;
+        $umisByBaitAdj{$_}{Mut}{$bait} = $umisByBait{$_}{Mut}{$bait} + 0;
+      } else {
+        $countsByBait{$_}{All}{$bait} = ( $countsByBait{$_}{WtLeft}{$bait} +
+                                          $countsByBait{$_}{WtRight}{$bait} +
+                                          $countsByBait{$_}{MutWtLeft}{$bait} +
+                                          $countsByBait{$_}{MutWtRight}{$bait} ) / 2;
+        $umisByBait{$_}{All}{$bait} = ( $umisByBait{$_}{WtLeft}{$bait} +
+                                        $umisByBait{$_}{WtRight}{$bait} +
+                                        $umisByBait{$_}{MutWtLeft}{$bait} +
+                                        $umisByBait{$_}{MutWtRight}{$bait} ) / 2;
+      }
+    }
+  }
+}
+
+# Adjust bait depths by other mutant reads for unambig and nobind reads
+# Would be good to do this in future for properly assessed mutA_mutB_wt reads
+# Also would be good to properly incorporate adjusted counts
+foreach ( keys %itdkeysfiltered ) {
+  foreach my $bait ( @baitsAll ) { 
+    if( exists( $baitIssues{$_}{unambig}{$bait} ) ||
+        exists( $baitIssues{$_}{nobind}{$bait} ) ) {
+      foreach my $itd ( keys %itdkeysfiltered ) {
+        if( $itd ne $_ ) { 
+	  $countsByBait{$_}{All}{$bait} += $countsByBait{$itd}{Mut}{$bait};
+	  $umisByBait{$_}{All}{$bait} += $umisByBait{$itd}{Mut}{$bait};
+        }  
+      }
+    } else {
+      foreach my $itd ( keys %itdkeysfiltered ) {
+        if( $itd ne $_ ) { 
+	  $countsByBait{$_}{All}{$bait} += ( $countsByBait{$_}{MutMutLeft}{$bait} +
+					     $countsByBait{$_}{MutMutRight}{$bait} ) / 2; 
+	  $umisByBait{$_}{All}{$bait} += ( $umisByBait{$_}{MutMutLeft}{$bait} +
+					   $umisByBait{$_}{MutMutRight}{$bait} ) / 2; 
+        }
+      }
+    }
+  }
+}
+
+# Make sure countsByBait of Mut is not greater than countsByBait of All
+foreach ( keys %itdkeysfiltered ) {
+  foreach my $bait ( @baitsAll ) { 
+    if( $countsByBait{$_}{All}{$bait} < $countsByBait{$_}{Mut}{$bait} ) {
+      $countsByBait{$_}{All}{$bait} = $countsByBait{$_}{Mut}{$bait};
+    }
+    if( $umisByBait{$_}{All}{$bait} < $umisByBait{$_}{Mut}{$bait} ) {
+      $umisByBait{$_}{All}{$bait} = $umisByBait{$_}{Mut}{$bait};
+    }
+    if( $countsByBaitAdj{$_}{All}{$bait} < $countsByBaitAdj{$_}{Mut}{$bait} ) {
+      $countsByBaitAdj{$_}{All}{$bait} = $countsByBaitAdj{$_}{Mut}{$bait};
+    }
+    if( $umisByBaitAdj{$_}{All}{$bait} < $umisByBaitAdj{$_}{Mut}{$bait} ) {
+      $umisByBaitAdj{$_}{All}{$bait} = $umisByBaitAdj{$_}{Mut}{$bait};
+    }
+  }
+}
+}
+
+foreach( keys %itdkeysfiltered ) {
+  $coverageMut{$_} = 0; $coverageMutLeft{$_} = 0; $coverageMutRight{$_} = 0;
+  $coverageMutWt{$_} = 0; $coverageMutWtLeft{$_} = 0; $coverageMutWtRight{$_} = 0;
+  $coverageWt{$_} = 0; $coverageWtLeft{$_} = 0; $coverageWtRight{$_} = 0;
+  $covUmisMut{$_} = 0; $covUmisMutLeft{$_} = 0; $covUmisMutRight{$_} = 0;
+  $covUmisMutWtLeft{$_} = 0; $covUmisMutWtRight{$_} = 0;
+  $covUmisWt{$_} = 0; $covUmisWtLeft{$_} = 0; $covUmisWtRight{$_} = 0;
+  
+  if(exists($readsMut{$_})) { $coverageMut{$_} = scalar( keys %{$readsMut{$_}} ); }
+  if(exists($readsMutLeft{$_})) { $coverageMutLeft{$_} = scalar( keys %{$readsMutLeft{$_}} ); }
+  if(exists($readsMutRight{$_})) { $coverageMutRight{$_} = scalar( keys %{$readsMutRight{$_}} ); }
+  if(exists($readsMutWt{$_})) { $coverageMutWt{$_} = scalar( keys %{$readsMutWt{$_}} ); }
+  if(exists($readsMutWtLeft{$_})) { $coverageMutWtLeft{$_} = scalar( keys %{$readsMutWtLeft{$_}} ); }
+  if(exists($readsMutWtRight{$_})) { $coverageMutWtRight{$_} = scalar( keys %{$readsMutWtRight{$_}} ); }
+  if(exists($readsWt{$_})) { $coverageWt{$_} = scalar( keys %{$readsWt{$_}} ); }
+  if(exists($readsWtLeft{$_})) { $coverageWtLeft{$_} = scalar( keys %{$readsWtLeft{$_}} ); }
+  if(exists($readsWtRight{$_})) { $coverageWtRight{$_} = scalar( keys %{$readsWtRight{$_}} ); }
+  if(exists($umisMutAll{$_})) { $covUmisMut{$_} = scalar( keys %{$umisMutAll{$_}} ); }
+  if(exists($umisMutLeft{$_})) { $covUmisMutLeft{$_} = scalar( keys %{$umisMutLeft{$_}} ); }
+  if(exists($umisMutRight{$_})) { $covUmisMutRight{$_} = scalar( keys %{$umisMutRight{$_}} ); }
+  if(exists($umisMutWtLeft{$_})) { $covUmisMutWtLeft{$_} = scalar( keys %{$umisMutWtLeft{$_}} ); }
+  if(exists($umisMutWtRight{$_})) { $covUmisMutWtRight{$_} = scalar( keys %{$umisMutWtRight{$_}} ); }
+  if(exists($umisWtAll{$_})) { $covUmisWt{$_} = scalar( keys %{$umisWtAll{$_}} ); }
+  if(exists($umisWtLeft{$_})) { $covUmisWtLeft{$_} = scalar( keys %{$umisWtLeft{$_}} ); }
+  if(exists($umisWtRight{$_})) { $covUmisWtRight{$_} = scalar( keys %{$umisWtRight{$_}} ); }
+}
 
 my %coverageRadius = ();
-foreach my $cname (keys %coverageMut) {
+foreach my $cname (keys %itdkeysfiltered) {
     @line_cells = split( /\_/, $cname );
     $coverageRadius{$cname} = [(0) x (substr($line_cells[1], 6)+length($refseq))];
 }
@@ -2354,8 +3050,9 @@ if( !$debug && system( "rm " . $fbase . "_to_candidate_ITDs.filtered.sam" ) ) {
   die "Error removing to_candidate_ITDs_filtered alignment file. Exiting...";
 }
 
-my %coverageDets = ();
-foreach my $cname ( keys %coverageRadius ) {
+my $rAFsum = 0; my $uAFsum = 0; my $auAFsum = 0;
+my %coverageDets = (); my %coverageTots = ();
+foreach my $cname ( keys %itdkeysfiltered ) {
     $coverageDets{$cname} = { "0"=>0, "1-5"=>0, "6-10"=>0, "11-25"=>0, "26-50"=>0, ">50"=>0 };
     for( my $i = $candidatedets{$cname}{dup_r0};
 	 $i <= 2 * $candidatedets{$cname}{dup_r1} - $candidatedets{$cname}{dup_r0} + $candidatedets{$cname}{inslen} + 1; $i++ ) {
@@ -2373,55 +3070,228 @@ foreach my $cname ( keys %coverageRadius ) {
 	    $coverageDets{$cname}{">50"} += 1; 
 	}
     }
+    my $mutCount = 0; my $mwCount = 0; my $mutCountUmi = 0; my $mwCountUmi = 0;
+    my $mutCountAdj = 0; my $mutCountUmiAdj = 0; my $mwCountAdj = 0; my $mwCountUmiAdj = 0;
+    if( $probes ne "" ) {
+	foreach my $bait ( @baitsAll ) {
+	    $mutCount += $countsByBait{$cname}{Mut}{$bait};
+	    $mwCount += $countsByBait{$cname}{All}{$bait};
+	    $mutCountUmi += $umisByBait{$cname}{Mut}{$bait};
+	    $mwCountUmi += $umisByBait{$cname}{All}{$bait};
+	    $mutCountAdj += $countsByBaitAdj{$cname}{Mut}{$bait};
+	    $mwCountAdj += $countsByBaitAdj{$cname}{All}{$bait};
+	    $mutCountUmiAdj += $umisByBaitAdj{$cname}{Mut}{$bait};
+	    $mwCountUmiAdj += $umisByBaitAdj{$cname}{All}{$bait};
+	}
+	$mutCountAdj += $mutCount;
+	$mwCountAdj += $mwCount;
+	$mutCountUmiAdj += $mutCountUmi;
+	$mwCountUmiAdj += $mwCountUmi;
+	$coverageTots{$cname}{rAdj} = $mutCountAdj;
+	$coverageTots{$cname}{uAdj} = $mutCountUmiAdj;
+	$coverageTots{$cname}{arAdj} = $mutCountAdj/$mwCountAdj;
+    } elsif( $ngstype eq "HC" ) {
+	$mutCount = ($coverageMutLeft{$cname}+$coverageMutRight{$cname})/2;
+	$mwCount = ($coverageWtLeft{$cname}+$coverageWtRight{$cname}+
+		    $coverageMutWtLeft{$cname}+$coverageMutWtRight{$cname})/2;
+	$mutCountUmi = ($covUmisMutLeft{$cname}+$covUmisMutRight{$cname})/2;
+	$mwCountUmi = ($covUmisWtLeft{$cname}+$covUmisWtRight{$cname}+
+		       $covUmisMutWtLeft{$cname}+$covUmisMutWtRight{$cname})/2;
+    } elsif( $ngstype eq "amplicon" ) {
+	$mutCount = $coverageMut{$cname};
+	$mwCount = $coverageWt{$cname}+$coverageMut{$cname};
+	$mutCountUmi = $covUmisMut{$cname};
+	$mwCountUmi = $covUmisWt{$cname}+$covUmisMut{$cname};
+    }
+
+    $mwCount = max( $mutCount, $mwCount );
+    $coverageTots{$cname}{rMut} = $mutCount;
+    $coverageTots{$cname}{rAll}= $mwCount;
+    if( $mwCount == 0 ) { $coverageTots{$cname}{rAF} = 0; } else { $coverageTots{$cname}{rAF} = $mutCount/$mwCount; }
+    
+    if( $umitag ne "" ) {
+	$mwCountUmi = max( $mutCountUmi, $mwCountUmi );
+	$mwCountUmiAdj = max( $mutCountUmiAdj, $mwCountUmiAdj );
+	$coverageTots{$cname}{uMut} = $mutCountUmi;
+	$coverageTots{$cname}{uAll} = $mwCountUmi;
+	if( $mwCountUmi == 0 ) { $coverageTots{$cname}{uAF} = 0; } else { $coverageTots{$cname}{uAF} = $mutCountUmi/$mwCountUmi; }
+	if( $mwCountUmiAdj == 0 ) { $coverageTots{$cname}{auAF} = 0; } else { $coverageTots{$cname}{auAF} = $mutCountUmiAdj/$mwCountUmiAdj; }
+    } else {
+	$coverageTots{$cname}{uMut} = 0;
+	$coverageTots{$cname}{uAll} = 0;
+	$coverageTots{$cname}{uAF} = 0;
+	$coverageTots{$cname}{auAF} = 0;
+    }
+    $rAFsum += $coverageTots{$cname}{rAF};
+    $uAFsum += $coverageTots{$cname}{uAF};
+    $auAFsum += $coverageTots{$cname}{auAF};
 }
 
-my $vcfstring = $vcfheader . $shortkey . "\n";
-foreach( keys %coverageDets ) {
-    my $mutCount = ($coverageMutLeft{$_}+$coverageMutRight{$_})/2;
-    my $mwCount = ($coverageWtLeft{$_}+$coverageWtRight{$_}+$coverageMutWtLeft{$_}+$coverageMutWtRight{$_})/2;
-    $vcfstring .= proc_vcf_from_keyfull($itdkeys{$_}, $candidatedets{$_}{keycdot} ) . "\t" .
-	"GENE=FLT3;STRAND=-;SVLEN=" . $candidatedets{$_}{itdsize} . 
-	";CDS=" . $candidatedets{$_}{keycdot} . ";AA=" . $candidatedets{$_}{keypdot} .
-#	";ALTCDS=" . $candidatedets{$_}{keycdotalt} . ";ALTAA=" . $candidatedets{$_}{keypdotalt} .
-	";AF=" . sprintf( "%.4g", $mutCount/$mwCount ) . ";DP=" . $mwCount . ";VD=" . $mutCount . ";SAMPLE=" . $shortkey .
-	"\tAF:DP:VD\t" . sprintf( "%.4g", $mutCount/$mwCount ) . ":" . $mwCount . ":" . $mutCount . "\n";
+# May need to consider edge cases where $rAFsum, $uAFsum, or $auAFsum is greater than 1
+foreach my $cname (keys %itdkeysfiltered) {
+  if( $rAFsum != 1 ) { $coverageTots{$cname}{rAR} = $coverageTots{$cname}{rAF}/(1-$rAFsum); } else { $coverageTots{$cname}{rAR} = "Inf"; }
+  if( $uAFsum != 1 ) { $coverageTots{$cname}{uAR} = $coverageTots{$cname}{uAF}/(1-$uAFsum); } else { $coverageTots{$cname}{uAR} = "Inf"; };
+  if( $auAFsum != 1 ) { $coverageTots{$cname}{auAR} = $coverageTots{$cname}{auAF}/(1-$auAFsum); } else { $coverageTots{$cname}{auAR} = "Inf"; } 
 }
-open( FO, ">" . $fbase . "_ITD.vcf" ) or die $!;
-print FO $vcfstring;
-close FO;
 
-if( $debug ) {
-  open(FO, ">" . $fbase . "_itddets.txt" ) or die $!;
-  foreach( sort {$coverageMut{$b}<=>$coverageMut{$a}} keys %coverageMut ) {
-    print FO $_ . "\t" . $itdkeysfiltered{$_} . "\t" . ($coverageMutLeft{$_} + $coverageMutRight{$_})/2 . "\t";
-    if( exists( $coverageWt{$_} ) ) { print FO ($coverageWtLeft{$_} + $coverageWtRight{$_})/2; }  else { print FO "NA"; }
-    print FO "\t" . $candidatedets{$_}{dup_r0} . "\t" . $candidatedets{$_}{dup_r1} . "\t" .
-	$candidatedets{$_}{inslen} . "\n";
+# Remove itds with no mutant reads or where neither endpoints is within an exon + buffer
+foreach( keys %itdkeysfiltered ) {
+  if( $coverageMut{$_} == 0 || $coverageTots{$_}{rMut} == 0 ||
+    ( !($candidatedets{$_}{dup_r0} > 585 && $candidatedets{$_}{dup_r0} < 721 ) &&
+      !($candidatedets{$_}{dup_r1} > 585 && $candidatedets{$_}{dup_r1} < 721 ) &&
+      !($candidatedets{$_}{dup_r0} > 808 && $candidatedets{$_}{dup_r0} < 916 ) &&
+      !($candidatedets{$_}{dup_r1} > 808 && $candidatedets{$_}{dup_r1} < 916 ) ) ) {
+    delete $itdkeysfiltered{$_};
   }
+}
+
+my $tabsummary = ""; my $othersummary = "";
+my $vcfstring = $vcfheader . $shortkey . "\n"; my $afb; my $uafb; my $tmpaf;
+foreach( keys %itdkeysfiltered ) {
+    my $nobind = "None"; my $dupbait = "None"; my $unambig = "None"; my @baits = ();
+    my $ucovb; my $rcovb; my $udetb;
+    
+    my $cdot = $candidatedets{$_}{keycdot}; my $pdot = $candidatedets{$_}{keypdot};
+    if( $pdot eq "not_exonic" && $candidatedets{$_}{keypdotalt} ne "not_exonic" ) {
+	$pdot = "not_exonic(alt_ " . $candidatedets{$_}{keypdotalt} . ")";
+    }
+    
+    if( $probes ne "" ) {
+      if( exists( $baitIssues{$_}{nobind} ) ) {
+        @baits = keys %{$baitIssues{$_}{nobind}};
+	if( scalar(@baits) > 0 ) { $nobind = $baits[0]; }
+	if( scalar(@baits) > 1 ) {
+          for( $i=1; $i<scalar(@baits); $i++ ) { $nobind .= "|" . $baits[$i]; }
+	} 
+      }
+      if( exists( $baitIssues{$_}{dupbait} ) ) {
+        @baits = keys %{$baitIssues{$_}{dupbait}};
+	if( scalar(@baits) > 0 ) { $dupbait = $baits[0]; }
+	if( scalar(@baits) > 1 ) {
+          for( $i=1; $i<scalar(@baits); $i++ ) { $dupbait .= "|" . $baits[$i]; }
+	} 
+      }
+      if( exists( $baitIssues{$_}{unambig} ) ) {
+        @baits = keys %{$baitIssues{$_}{unambig}};
+	if( scalar(@baits) > 0 ) { $unambig = $baits[0]; }
+	if( scalar(@baits) > 1 ) {
+          for( $i=1; $i<scalar(@baits); $i++ ) { $unambig .= "|" . $baits[$i]; }
+	} 
+      }
+	
+      my $baitdist = "";
+      if(exists($baitDists{$_}{$baitsAll[0]})) { $baitdist=$baitDists{$_}{$baitsAll[0]}; }
+
+      my $tb = $countsByBait{$_}{All}{$baitsAll[0]};
+      my $vb = $countsByBait{$_}{Mut}{$baitsAll[0]};
+      my $utb = $umisByBait{$_}{All}{$baitsAll[0]};
+      my $uvb = $umisByBait{$_}{Mut}{$baitsAll[0]};
+      if( $tb > 0 ) { $afb = sprintf( "%.3g", $vb / $tb ); } else { $afb = "NA"; }
+      if( $utb > 0 ) { $uafb = sprintf( "%.3g", $uvb / $utb ); } else { $uafb = "NA"; }
+      $ucovb = $uafb . "(" . $uvb . "/" . $utb . ")[" . $baitdist . "]";
+      $rcovb = $afb . "(" . $vb . "/" . $tb . ")";
+      $udetb = $uvb . "/" . $utb;
+
+      for( $i=1; $i<scalar(@baitsAll); $i++ ) {
+        $baitdist = "";
+	if(exists($baitDists{$_}{$baitsAll[$i]})) { $baitdist=$baitDists{$_}{$baitsAll[$i]}; }
+
+	my $tbi = $countsByBait{$_}{All}{$baitsAll[$i]};
+	my $vbi = $countsByBait{$_}{Mut}{$baitsAll[$i]};
+	my $utbi = $umisByBait{$_}{All}{$baitsAll[$i]};
+	my $uvbi = $umisByBait{$_}{Mut}{$baitsAll[$i]};
+
+	if( $tbi > 0 ) { $tmpaf = sprintf( "%.3g", $vbi/$tbi ); } else { $tmpaf = "NA"; }
+	$afb .= "," . $tmpaf;
+	$rcovb .= ";" . $tmpaf . "(" . $vbi . "/" . $tbi . ")";
+
+	if( $utbi > 0 ) { $tmpaf = sprintf( "%.3g", $uvbi/$utbi ); } else { $tmpaf = "NA"; }
+	$uafb .= "," . $tmpaf;
+	$ucovb .= ";" . $tmpaf . "(" . $uvbi . "/" . $utbi . ")[" . $baitdist . "]";
+	$udetb .= "," . $uvbi . "/" . $utbi;
+      }
+    }
+    
+    $vcfstring .= proc_vcf_from_keyfull($itdkeys{$_}, $cdot ) . "\t" .
+	"GENE=FLT3;STRAND=-;SVLEN=" . $candidatedets{$_}{itdsize} . 
+	";CDS=" . $cdot . ";AA=" . $pdot .
+        ";AR=" . sprintf( "%.4g", $coverageTots{$_}{uAR} ) . 
+	";AF=" . sprintf( "%.4g", $coverageTots{$_}{uAF} ) . 
+        ";DP=" . $coverageTots{$_}{uAll} . ";VD=" . $coverageTots{$_}{uMut} . 
+ 	";AAR=" . sprintf( "%.4g", $coverageTots{$_}{auAR} ) . 
+ 	";AAF=" . sprintf( "%.4g", $coverageTots{$_}{auAF} ) . 
+        ";RAR=" . sprintf( "%.4g", $coverageTots{$_}{rAR} ) . 
+	";RAF=" . sprintf( "%.4g", $coverageTots{$_}{rAF} ) . 
+        ";RDP=" . $coverageTots{$_}{rAll} . ";RVD=" . $coverageTots{$_}{rMut} .
+	";SAMPLE=" . $shortkey .
+	"\tAR:AF";
+    if( $probes ne "" ) { $vcfstring .= ":AFB"; }
+    $vcfstring .= ":DP:VD:AAR:AAF:RAR:RAF:RDP:RVD:CR";
+    if( $probes ne "" ) { $vcfstring .= ":DB:NB:RB:AFB1:Fwd1:Fwd2:Fwd3:Rev1:Rev2:Rev3:Oth"; }
+    $vcfstring .= "\t" . 
+	sprintf( "%.4g", $coverageTots{$_}{uAR} ) . ":" . 
+	sprintf( "%.4g", $coverageTots{$_}{uAF} );
+    if( $probes ne "" ) { $vcfstring .= ":" . $uafb; }
+    $vcfstring .=  ";" .
+	$coverageTots{$_}{uAll} . ":" . $coverageTots{$_}{uMut} . ":" . 
+	sprintf( "%.4g", $coverageTots{$_}{auAR} ) . ":" . 
+	sprintf( "%.4g", $coverageTots{$_}{auAF} ) . ":" . 
+	sprintf( "%.4g", $coverageTots{$_}{rAR} ) . ":" .
+	sprintf( "%.4g", $coverageTots{$_}{rAF} ) . ":" . 
+	$coverageTots{$_}{rAll} . ":" . $coverageTots{$_}{rMut} . ":" . 
+	$coverageDets{$_}{"0"} . "," . $coverageDets{$_}{"1-5"} . "," .
+	$coverageDets{$_}{"6-10"} . "," . $coverageDets{$_}{"11-25"} . "," .
+	$coverageDets{$_}{"26-50"} . "," . $coverageDets{$_}{">50"};
+    if( $probes ne "" ) { $vcfstring .= ":" . $dupbait . ":" . $nobind . ":". $unambig . ":" . $ucovb; }
+    $vcfstring .= "\n"; 
+
+    $tabsummary .= $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" . $cdot . "\t" . $pdot . "\t";
+    if( $probes ne "" ) { $tabsummary .= $dupbait . "\t" . $nobind . "\t". $unambig . "\t"; }
+    $tabsummary .= $coverageDets{$_}{"0"} . "," . $coverageDets{$_}{"1-5"} . "," .
+	$coverageDets{$_}{"6-10"} . "," . $coverageDets{$_}{"11-25"} . "," .
+	$coverageDets{$_}{"26-50"} . "," . $coverageDets{$_}{">50"} . "\t" .
+ 	sprintf( "%.4g", $coverageTots{$_}{auAR} ) . "\t" . 
+ 	sprintf( "%.4g", $coverageTots{$_}{auAF} ) . "\t" .
+        sprintf( "%.4g", $coverageTots{$_}{uAR} ) . "\t" .
+	sprintf( "%.4g", $coverageTots{$_}{uAF} ) . "\t";
+    if( $probes ne "" ) { $tabsummary .= $uafb . "\t"; }
+    $tabsummary .= $coverageTots{$_}{uMut} . "\t" . $coverageTots{$_}{uAll} . "\t" .
+        sprintf( "%.4g", $coverageTots{$_}{rAR} ) . "\t" .
+	sprintf( "%.4g", $coverageTots{$_}{rAF} ) . "\t" .
+        $coverageTots{$_}{rMut} . "\t" . $coverageTots{$_}{rAll};
+    if( $probes ne "" ) { $tabsummary .= "\t" . $ucovb . "\t". $rcovb; }
+    $tabsummary .= "\n";
+}
+
+foreach( keys %itdkeysfiltered ) {
+    if( $candidatedets{$_}{dup_r0} == -1 && $candidatedets{$_}{dup_r1} == -1 &&
+        $candidatedets{$_}{mutbk_s0} == -1 && $candidatedets{$_}{mutbk_s1} == -1 ) {
+      $othersummary .= $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" .
+	$candidatedets{$_}{keycdot} . "\t" . $candidatedets{$_}{keypdot} . "\n";
+    }
+}
+
+if( $tabsummary ne "" ) {
+  open( FO, ">" . $fbase . "_ITD.vcf" ) or die $!;
+  print FO $vcfstring;
   close FO;
 
-  my $coverageOut = ""; my $tmpOut;
-  foreach( keys %coverageDets ) {
-    $tmpOut = $_ . "\t" . $candidatedets{$_}{itdsize} . "\t" . $candidatedets{$_}{ie};
-    if( $proc_output_rhp ) {
-	$tmpOut .= "\t" . $coverageMutLeft{$_} . "\t" . $coverageMutRight{$_} . "\t" . 
-	    $coverageWtLeft{$_} . "\t" . $coverageWtRight{$_};
-    }
-    $tmpOut .= "\t" . ($coverageMutLeft{$_}+$coverageMutRight{$_})/2 . "\t" . 
-	($coverageWtLeft{$_}+$coverageWtRight{$_}+$coverageMutWtLeft{$_}+$coverageMutWtRight{$_})/2 . "\t" . 
-	$coverageDets{$_}{"0"} ."\t" . $coverageDets{$_}{"1-5"} ."\t" . $coverageDets{$_}{"6-10"} ."\t" . 
-	$coverageDets{$_}{"11-25"} ."\t" . $coverageDets{$_}{"26-50"} ."\t" . $coverageDets{$_}{">50"} . "\t" .
-	$candidatedets{$_}{dup_r0} . "\t" . $candidatedets{$_}{dup_r1} . "\t" .
-	$candidatedets{$_}{keycdot} . "\t" . $candidatedets{$_}{keypdot} . "\t" .
-	$candidatedets{$_}{keycdotalt} . "\t" . $candidatedets{$_}{keypdotalt} . "\n";
-    $coverageOut .= $tmpOut;
-  }
-  print $coverageOut; print $vcfstring . "\n";
+  open( FO, ">" . $fbase . "_ITD_summary.txt" ) or die $!;
+  print FO $tabsummary;
+  close FO;
+} else {
+  system( "touch " . $fbase . "_ITD_none.vcf" );
+}
+
+if( $othersummary ne "" ) {
+  open( FO, ">" . $fbase . "_other_summary.txt" ) or die $!;
+  print FO $othersummary;
+  close FO;
 }
 
 #### GENERATE TVIEW HTML FILES
 if( $web ) {
-  foreach( keys %coverageMut ) {
+  foreach( keys %itdkeysfiltered ) {
     $candidate = $_;
     $candidateseq = $candidateSeqs{$_}; 
     $candidatename = $candidateNames{$_}; 
@@ -2440,7 +3310,7 @@ if( $web ) {
     die "Error making sorted candidate_ITDs mutreads alignment file. Exiting...";
   }
 
-  foreach( keys %coverageMut ) {
+  foreach( keys %itdkeysfiltered ) {
     my $fi = $fbase . "_other_candidate" . $_ . "_reads=" . $coverageMut{$_} . ".html";
     @line_cells = split( /\_/, $_ );
     if( system( sprintf( "COLUMNS=%s %s tview -d H %s %s > %s",
@@ -2458,11 +3328,14 @@ if( $web ) {
 	die "Error removing candidate fasta files. Exiting...";
     }
 
-    my $replaceseq = ""; my $fo;
+    my $replaceseq = ""; my $replacekey = ""; my $ckey = ""; my $fo;
     if( exists( $candidatedets{$_} ) ) {
 	$replaceseq = $candidatedets{$_}{dupseq};
-	my $ckey = $candidatedets{$_}{keycdot}; $ckey =~ s/c\./c/; $ckey =~ s/\//ins/g;
-	$fo = $fbase . "_" . $ckey . "_length=" . $candidatedets{$_}{itdsize} . "_reads=" . $coverageMut{$_} . ".html";
+	$replacekey = $_;
+	#$ckey = $candidatedets{$_}{keycdot}; $ckey =~ s/c\./c/; $ckey =~ s/\//ins/g;
+	#$fo = $fbase . "_" . $ckey . "_length=" . $candidatedets{$_}{itdsize} . "_reads=" . $coverageMut{$_} . ".html";
+	$ckey = $candidatedets{$_}{keycdot} . "_length=" . $candidatedets{$_}{itdsize} . "_rawcov=" . $coverageTots{$_}{rMut}; 
+	$fo = $fbase . "_candidate_" . $_ . ".html";
 	print $fo . "\n";
     } 
 
@@ -2474,6 +3347,7 @@ if( $web ) {
 	while(<FI>) {
 	    $_ =~ s/$htmlold/$htmlnew/g;
 	    $_ =~ s/"fuchsia"/"blue"/;
+	    $_ =~ s/$replacekey/$ckey/g;
 	    print FO $_;
 	}
 	close FI;
@@ -2484,7 +3358,6 @@ if( $web ) {
   }
 
   if( !$debug && (
-    system( "rm " . $fbase . "_to_candidate_ITDs.mutreads.sam" ) ||
     system( "rm " . $fbase . "_to_candidate_ITDs.mutreads.bam" ) ||
     system( "rm " . $fbase . "_to_candidate_ITDs.mutreads.sorted.bam" ) ||
     system( "rm " . $fbase . "_to_candidate_ITDs.mutreads.sorted.bam.bai" ) ) ) {
@@ -2492,3 +3365,6 @@ if( $web ) {
   }
 }
 
+if( !$debug && system( "rm " . $fbase . "_to_candidate_ITDs.mutreads.sam" ) ) {
+    die "Error removing to_candidte_ITDs mutreads alignment files. Exiting..." ;
+}
