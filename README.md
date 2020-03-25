@@ -13,12 +13,15 @@ Assumptions:
 ## Version 1.0
 Second commit.
 Changes:
-1. Platforms supported (flag -n): HC (hybrid-capture), amplicon, Archer*, NEB* (*assumes fasta and bwa index files of the primers) 
+1. Platforms supported (flag -n): HC (hybrid-capture), amplicon, Archer*, NEB* (*assumes fasta and bwa index files of the primers).
 2. Three read populations may be processed from a bam (flag -t): "targeted" (default: alignments to FLT3 target locus), "loose" (also includes unmapped reads), or "all". 
 3. Trims illumina adapters by default (AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC,AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT). May turn off trimming (flag: -a 0), but does not support other adapters.
 4. UMI-aware bams from fgbio supported (flag -u "RX").
 5. Bams relative to hg38 supported (flag -g hg38).
-6. Following extraneous software tools are used and assumed in the path (otherwise script should be modified): bwa, samtools, sumaclust, fgbio, bbduk, bedtools.
+
+Before running perl script for first time:
+1. Create a bwa index for the FLT3 target locus from the provided fasta file ("bwa index -p FLT3_dna_e1415 FLT3_dna_e14e15.fa") and modify script to provide path of the index if necessary (variable $refindex).
+2. Download following software tools as needed and add to path (or modify script with paths): bwa, samtools, sumaclust, fgbio, bbduk, bedtools, java.
 
 ## License
 [MIT](https://choosealicense.com/licenses/mit/)
