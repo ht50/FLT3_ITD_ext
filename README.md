@@ -19,6 +19,12 @@ Changes:
 4. UMI-aware bams from fgbio supported (flag -u "RX").
 5. Bams relative to hg38 supported (flag -g hg38).
 
+## Version 1.1
+Changes:
+1. Argument for fgbio umi strategy (flag -s), e.g. to support duplex umi bams
+2. Minreads argument (flag -mr)
+3. Conservative filters hardcoded to remove spurious ITD candidates from accidental extension (reported instead in "other_summary" output file)
+
 Before running perl script for first time:
 1. Create a bwa index for the FLT3 target locus from the provided fasta file ("bwa index -p FLT3_dna_e1415 FLT3_dna_e14e15.fa") and modify script to provide path of the index if necessary (variable $refindex).
 2. Download following software tools as needed and add to path (or modify script with paths): bwa, samtools, sumaclust, fgbio, bbduk, bedtools, java.

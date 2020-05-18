@@ -27,15 +27,17 @@ FLT3_ITD_ext  Process bamfiles or fastqs for FLT3-ITDs
   --ngstype, -n NGS platform type (defaults to "HC" [hybrid capture]; or can be "amplicon", "NEB", or "Archer")
   --genome, -g  Genome build (defaults to "hg19"; or can be "hg38")
   --adapter, -a	Trim adapters (defaults to true; assumes illumina)
-  --web, -w	Create html webpages for each ITD call (defaults to true)
+  --web, -w	Create html webpages for each ITD call (defaults to false)
   --umitag, -u  BAM tag holding UMIs in the input bamfile for fgbio (defaults to ""; standard is "RX")
+  --strat, -s   Strategy for UMI assignment used in fgbio GroupReadsByUmi (defaults to "adjacency" )
   --probes, -p  Probes/baits file basename (defaults to ""); assumes fasta file, bwa indexfiles
+  --minreads, -mr  Minimum number of supporting reads to be included in VCF (umi-based if umitag set)
   --debug, -d	Save all intermediate files (defaults to false)
   --help, -h	Print this help
 
 =head1 VERSION
 
-1.0
+1.1
 
 =cut
 
@@ -48,9 +50,11 @@ GetOptions(
   "ngstype|n=s" => \(my $ngstype = "HC"),
   "genome|g=s" => \(my $genome = "hg19"),
   "adapter|a=s" => \(my $adapter = 1),
-  "web|w=s" => \(my $web = 1),
+  "web|w=s" => \(my $web = 0),
   "umitag|u=s" => \(my $umitag = ""),
+  "strat|s=s" => \(my $strat = "adjacency"),
   "probes|p=s" => \(my $probes = ""),
+  "minreads|mr=s" => \(my $minreads = 0),
   "debug|d" => \(my $debug = 0),
   "help|h" => sub { HelpMessage(0) }, 
 ) or HelpMessage(1);
@@ -89,12 +93,16 @@ my $minToCluster = 1;
 my $maxEditDist = 5;  
 my $maxInsAllowed = 2; # cannot have more than this in total ins to count as wt or itd
 my $maxDelAllowed = 2; # cannot have more than this in total del to count as wt or itd
-my $maxClipAllowed = 2; # cannot have more than this in max softclip to count as wt or itd
+my $maxClipAllowed = 3; # cannot have more than this in max softclip to count as wt or itd
 my $minClipToAlign = 9; 
 my $manualItdCheckLength = 12; 
 my $buffer = 10;  # buffer size past breakpoint needed for alignment to be included in counts
 my $clipMatchRatioThreshold = 0.5; # ratio of clip matches to clip length needs to be at least this value in order to extend the clip
 my $maxITDsize = 500;
+
+# Conservative thresholds for filtering out ITD noise (e.g. from accidental extension)
+my $noisyMinItdSize = 200;
+my $noisyMinNocovRatio = 0.5; # ratio of the full duplicated sequence that is uncovered by mutant reads
 
 # May be able to merge these, however staggered approach generates less false positives
 my $bwaSeedLength = 15;
@@ -111,7 +119,6 @@ open (FI, $reffasta ) or die $!;
 while(<FI>) { if( !/^>/ ) { chomp; $refseq .= $_; } }
 close FI;
 
-
 my $alignerLocal  = "bwa";  # "bwa" or "novo" or "bowtie2"
 my $alignerClips  = "bwa";  # used for aligning softclips to reference
 my $alignerExts   = "bwa";  # used for aligning extended reads to reference (bowtie2 is better at global)
@@ -126,7 +133,7 @@ my $proc_one_itd_per_size = 0;
 my $proc_singleread_itds = 0;
 my $proc_anylength_itds = 0;
 
-my @line_cells; my @sub_cells; my @p_cells; my @s_cells; my @a;
+my @line_cells; my @sub_cells; my @s_cells; my @a;
 my $key; my $readname; my $cigar; my $seq; my $qa; my $i; my $j; my $k;
 my %readlengths = ();
 
@@ -282,6 +289,7 @@ sub proc_to_cdot_coords {
     for( my $i=0; $i<scalar(@iestarts)-1; $i++ ) {
 	if( $rpos >= $iestarts[$i] && $rpos < $iestarts[$i+1] ) { $ie = $i; }
     }
+    if( $rpos == 1500 ) { $ie = scalar(@ielabs)-1; }
 
     if( $ie >= 0 ) {
 	if( substr($ielabs[$ie],0,1) eq "e" ) {
@@ -1758,8 +1766,8 @@ if( $umitag ne "" ) {
     die "Failed to convert wt sam to bam. Exiting...\n";
   }
 
-  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_wt.bam -o %s_wt_umigroups.bam -s adjacency -f %s_wt_umisizes.txt", 
-	$javacmd, $fgbiojar, $fbase, $fbase, $fbase ) ) ) {
+  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_wt.bam -o %s_wt_umigroups.bam -s %s -f %s_wt_umisizes.txt", 
+	$javacmd, $fgbiojar, $fbase, $fbase, $strat, $fbase ) ) ) {
     die "Failed to perform fgbio GroupReadsByUmi on wildtype reads...\n";
   }
 
@@ -2364,7 +2372,8 @@ if( $umitag ne "" ) {
     die "Failed to convert mutant sam to bam. Exiting...\n";
   }
 
-  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_mut.bam -o %s_mut_umigroups.bam -s Adjacency -f %s_mut_umisizes.txt -m 0", $javacmd, $fgbiojar, $fbase, $fbase, $fbase ) ) ) {
+  if( system( sprintf( "%s -jar %s GroupReadsByUmi -i %s_mut.bam -o %s_mut_umigroups.bam -s %s -f %s_mut_umisizes.txt -m 0",
+		       $javacmd, $fgbiojar, $fbase, $fbase, $strat, $fbase ) ) ) {
     die "Failed to perform fgbio GroupReadsByUmi on mutant reads...\n";
   }
 
@@ -3145,8 +3154,7 @@ foreach( keys %itdkeysfiltered ) {
   }
 }
 
-my $tabsummary = ""; my $othersummary = "";
-my $vcfstring = $vcfheader . $shortkey . "\n"; my $afb; my $uafb; my $tmpaf;
+my $outvcf = ""; my $outsummary = ""; my $outother = ""; my $afb; my $uafb; my $tmpaf;
 foreach( keys %itdkeysfiltered ) {
     my $nobind = "None"; my $dupbait = "None"; my $unambig = "None"; my @baits = ();
     my $ucovb; my $rcovb; my $udetb;
@@ -3212,7 +3220,7 @@ foreach( keys %itdkeysfiltered ) {
       }
     }
     
-    $vcfstring .= proc_vcf_from_keyfull($itdkeys{$_}, $cdot ) . "\t" .
+    my $vcfstring = proc_vcf_from_keyfull($itdkeys{$_}, $cdot ) . "\t" .
 	"GENE=FLT3;STRAND=-;SVLEN=" . $candidatedets{$_}{itdsize} . 
 	";CDS=" . $cdot . ";AA=" . $pdot .
         ";AR=" . sprintf( "%.4g", $coverageTots{$_}{uAR} ) . 
@@ -3232,7 +3240,7 @@ foreach( keys %itdkeysfiltered ) {
 	sprintf( "%.4g", $coverageTots{$_}{uAR} ) . ":" . 
 	sprintf( "%.4g", $coverageTots{$_}{uAF} );
     if( $probes ne "" ) { $vcfstring .= ":" . $uafb; }
-    $vcfstring .=  ";" .
+    $vcfstring .=  ":" .
 	$coverageTots{$_}{uAll} . ":" . $coverageTots{$_}{uMut} . ":" . 
 	sprintf( "%.4g", $coverageTots{$_}{auAR} ) . ":" . 
 	sprintf( "%.4g", $coverageTots{$_}{auAF} ) . ":" . 
@@ -3245,7 +3253,7 @@ foreach( keys %itdkeysfiltered ) {
     if( $probes ne "" ) { $vcfstring .= ":" . $dupbait . ":" . $nobind . ":". $unambig . ":" . $ucovb; }
     $vcfstring .= "\n"; 
 
-    $tabsummary .= $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" . $cdot . "\t" . $pdot . "\t";
+    my $tabsummary = $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" . $cdot . "\t" . $pdot . "\t";
     if( $probes ne "" ) { $tabsummary .= $dupbait . "\t" . $nobind . "\t". $unambig . "\t"; }
     $tabsummary .= $coverageDets{$_}{"0"} . "," . $coverageDets{$_}{"1-5"} . "," .
 	$coverageDets{$_}{"6-10"} . "," . $coverageDets{$_}{"11-25"} . "," .
@@ -3261,31 +3269,47 @@ foreach( keys %itdkeysfiltered ) {
         $coverageTots{$_}{rMut} . "\t" . $coverageTots{$_}{rAll};
     if( $probes ne "" ) { $tabsummary .= "\t" . $ucovb . "\t". $rcovb; }
     $tabsummary .= "\n";
+
+    my $covLength = sum values %{$coverageDets{$_}};
+    if( ( $umitag ne "" && $coverageTots{$_}{uMut} < $minreads ) ||
+	( $umitag eq "" && $coverageTots{$_}{rMut} < $minreads ) ||
+	( $candidatedets{$_}{itdsize} >= $noisyMinItdSize && $covLength > 0 && 
+	  $coverageDets{$_}{"0"}/$covLength >= $noisyMinNocovRatio ) ) {
+	$outother .= $tabsummary;
+    } else {
+	$outvcf .= $vcfstring;
+	$outsummary .= $tabsummary;
+    }
 }
 
 foreach( keys %itdkeysfiltered ) {
     if( $candidatedets{$_}{dup_r0} == -1 && $candidatedets{$_}{dup_r1} == -1 &&
         $candidatedets{$_}{mutbk_s0} == -1 && $candidatedets{$_}{mutbk_s1} == -1 ) {
-      $othersummary .= $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" .
-	$candidatedets{$_}{keycdot} . "\t" . $candidatedets{$_}{keypdot} . "\n";
+	$outother .= $shortkey . "\t" . $candidatedets{$_}{itdsize} . "\t" .
+	    $candidatedets{$_}{keycdot} . "\t" . $candidatedets{$_}{keypdot} . "\t";
+	if( $probes ne "" ) { $outother .= "?\t?\t?\t?\t?\t?\t"; }
+	$outother .= "?\t?\t?\t?\t?\t?\t?\t?\t?\t?\t?\n";
     }
 }
 
-if( $tabsummary ne "" ) {
+if( $outvcf ne "" ) {
   open( FO, ">" . $fbase . "_ITD.vcf" ) or die $!;
-  print FO $vcfstring;
-  close FO;
-
-  open( FO, ">" . $fbase . "_ITD_summary.txt" ) or die $!;
-  print FO $tabsummary;
+  print FO $vcfheader . $shortkey . "\n";
+  print FO $outvcf;
   close FO;
 } else {
   system( "touch " . $fbase . "_ITD_none.vcf" );
 }
 
-if( $othersummary ne "" ) {
+if( $outsummary ne "" ) {
+  open( FO, ">" . $fbase . "_ITD_summary.txt" ) or die $!;
+  print FO $outsummary;
+  close FO;
+}
+  
+if( $outother ne "" ) {
   open( FO, ">" . $fbase . "_other_summary.txt" ) or die $!;
-  print FO $othersummary;
+  print FO $outother;
   close FO;
 }
 
