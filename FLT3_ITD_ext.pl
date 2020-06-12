@@ -3143,15 +3143,17 @@ foreach my $cname (keys %itdkeysfiltered) {
   if( $auAFsum != 1 ) { $coverageTots{$cname}{auAR} = $coverageTots{$cname}{auAF}/(1-$auAFsum); } else { $coverageTots{$cname}{auAR} = "Inf"; } 
 }
 
-# Remove itds with no mutant reads or where neither endpoints is within an exon + buffer
+# Remove itds with no mutant reads and flag ITDs where neither endpoints is within an exon + buffer
+my %itdother = ();
 foreach( keys %itdkeysfiltered ) {
-  if( $coverageMut{$_} == 0 || $coverageTots{$_}{rMut} == 0 ||
-    ( !($candidatedets{$_}{dup_r0} > 585 && $candidatedets{$_}{dup_r0} < 721 ) &&
-      !($candidatedets{$_}{dup_r1} > 585 && $candidatedets{$_}{dup_r1} < 721 ) &&
-      !($candidatedets{$_}{dup_r0} > 808 && $candidatedets{$_}{dup_r0} < 916 ) &&
-      !($candidatedets{$_}{dup_r1} > 808 && $candidatedets{$_}{dup_r1} < 916 ) ) ) {
-    delete $itdkeysfiltered{$_};
-  }
+    if( $coverageMut{$_} == 0 || $coverageTots{$_}{rMut} == 0 ) {
+	delete $itdkeysfiltered{$_};
+    } elsif( !($candidatedets{$_}{dup_r0} > 585 && $candidatedets{$_}{dup_r0} < 721 ) &&
+	     !($candidatedets{$_}{dup_r1} > 585 && $candidatedets{$_}{dup_r1} < 721 ) &&
+	     !($candidatedets{$_}{dup_r0} > 808 && $candidatedets{$_}{dup_r0} < 916 ) &&
+	     !($candidatedets{$_}{dup_r1} > 808 && $candidatedets{$_}{dup_r1} < 916 ) ) {
+	$itdother{$_} = 1;
+    }
 }
 
 my $outvcf = ""; my $outsummary = ""; my $outother = ""; my $afb; my $uafb; my $tmpaf;
@@ -3271,7 +3273,8 @@ foreach( keys %itdkeysfiltered ) {
     $tabsummary .= "\n";
 
     my $covLength = sum values %{$coverageDets{$_}};
-    if( ( $umitag ne "" && $coverageTots{$_}{uMut} < $minreads ) ||
+    if( exists( $itdother{$_} ) ||
+	( $umitag ne "" && $coverageTots{$_}{uMut} < $minreads ) ||
 	( $umitag eq "" && $coverageTots{$_}{rMut} < $minreads ) ||
 	( $candidatedets{$_}{itdsize} >= $noisyMinItdSize && $covLength > 0 && 
 	  $coverageDets{$_}{"0"}/$covLength >= $noisyMinNocovRatio ) ) {
