@@ -1410,26 +1410,13 @@ sub proc_vcf_from_keyfull {
     #argument #2: keycdot
     my $keyc = $_[1];
 
-    my @cells = split(/\_/, $keyf);
-
-    my $ins = ""; my $ref0 = ""; my $ref1 = ""; my $mm0 = ""; my $mm1 = "";
-
-    $ref0 = $cells[0];
-    if( scalar(@cells) == 2 ) {
-	$ref1 = $cells[1];
-    } elsif( scalar(@cells) == 3 ) {
-	$ins = $cells[1];
-	$ref1 = $cells[2];
-    }
-
-    if( $ref0 !~ /^ref/ || $ref1 !~ /^ref/ ||
-	(length($ins)>0 && $ins !~ /^ins/  ) ) {
-	return( "" );
-    }
-
-    $ref0 =~ s/ref//; $ref1 =~ s/ref//; $ins =~ s/ins//;
-
-    @cells = split( /\(/, $ref0 );
+    my @regions = split(/\_/, $keyf);
+    my $ref0 = $regions[0]; my $ref1 = $regions[scalar(@regions)-1];
+    if( scalar(@regions) < 2 || $ref0 !~ /^ref/ || $ref1 !~ /^ref/ ) { return(""); }
+    
+    $ref0 =~ s/ref//; $ref1 =~ s/ref//;
+    my $mm0 = ""; my $mm1 = ""; 
+    my @cells = split( /\(/, $ref0 );
     my @coords0 = split( /\-/, $cells[0] );
     if( scalar(@cells) > 1 ) { $mm0 = $cells[1]; $mm0 =~ s/\)//; }
 
@@ -1437,7 +1424,7 @@ sub proc_vcf_from_keyfull {
     my @coords1 = split( /\-/, $cells[0] );
     if( scalar(@cells) > 1 ) { $mm1 = $cells[1]; $mm1 =~ s/\)//; }
 
-    my @mmlocs0 = (); my @mmlocs1 = (); my $seq0 = $refseq; my $seq1 = $refseq;
+    my $seq0 = $refseq; my $seq1 = $refseq; my @mmlocs0 = (); my @mmlocs1 = (); 
     if( length($mm0) > 0 ) {
 	@cells = split(/\+/, $mm0);
 	foreach my $mm ( @cells ) {
@@ -1463,16 +1450,43 @@ sub proc_vcf_from_keyfull {
     my $dupstart = $coords1[0];
     if( length($mm1) > 0 ) { $dupstart = max(@mmlocs1)+1; }
 
+    my $ins = "";
+    if( scalar(@regions) > 2 ) {
+	for( my $i=1; $i < scalar(@regions)-1; $i++ ) {
+	    my $tmpseq = $regions[$i];
+	    if( $tmpseq =~ /^ins/ ) {
+		$tmpseq =~ s/ins//;
+	    } elsif( $tmpseq =~ /^ref/ ) {
+		$tmpseq =~ s/ref//;		
+		@cells = split( /\(/, $tmpseq );
+		my @coords = split( /\-/, $cells[0] ); my $seq2 = $refseq;
+		if( scalar(@cells) > 1 ) {
+		    my $mm2 = $cells[1]; $mm2 =~ s/\)//;
+		    @cells = split(/\+/, $mm2);
+		    foreach my $mm ( @cells ) {
+			my @subcells = split( /\:/, $mm );
+			my @subsubcells = split (/>/, $subcells[1] );
+			substr( $seq2, $subcells[0]-1, 1 ) = $subsubcells[1];
+		    }
+		}
+		$tmpseq = substr( $seq2, $coords[0]-1, $coords[1]-$coords[0]+1 );
+	    } else {
+		return( "" );
+	    }
+	    $ins .= $tmpseq;
+	}
+    }
+    
     my $alt;
     my $ref;
     if( $inspos+1 >= $dupstart ) {
 	$ref = substr( $refseq, $inspos, 1 );
 	$alt = substr($seq0, $inspos, $coords0[1]-$inspos) . $ins . 
-		  substr($seq1, $coords1[0]-1, $inspos-$coords1[0]+1) . $ref;
+	    substr($seq1, $coords1[0]-1, $inspos-$coords1[0]+1) . $ref;
     } else {
- 	$ref = substr( $refseq, $inspos, $dupstart-$inspos-1 );
+	$ref = substr( $refseq, $inspos, $dupstart-$inspos-1 );
 	$alt = substr($seq0, $inspos, $coords0[1]-$inspos) . $ins . 
-		  substr($seq1, $coords1[0]-1, $dupstart-$coords1[0]);
+	    substr($seq1, $coords1[0]-1, $dupstart-$coords1[0]);
     }
     $alt = reverse $alt; $alt =~ tr/ATGCatgc/TACGtacg/; 
     $ref = reverse $ref; $ref =~ tr/ATGCatgc/TACGtacg/;
@@ -2993,11 +3007,15 @@ foreach ( keys %itdkeysfiltered ) {
     if( $umisByBait{$_}{All}{$bait} < $umisByBait{$_}{Mut}{$bait} ) {
       $umisByBait{$_}{All}{$bait} = $umisByBait{$_}{Mut}{$bait};
     }
-    if( $countsByBaitAdj{$_}{All}{$bait} < $countsByBaitAdj{$_}{Mut}{$bait} ) {
-      $countsByBaitAdj{$_}{All}{$bait} = $countsByBaitAdj{$_}{Mut}{$bait};
+    if( $countsByBaitAdj{$_}{All}{$bait} + $countsByBait{$_}{All}{$bait} < 
+	$countsByBaitAdj{$_}{Mut}{$bait} + $countsByBait{$_}{Mut}{$bait} ) {
+      $countsByBaitAdj{$_}{All}{$bait} = $countsByBaitAdj{$_}{Mut}{$bait} +
+	  $countsByBait{$_}{Mut}{$bait} - $countsByBait{$_}{All}{$bait};
     }
-    if( $umisByBaitAdj{$_}{All}{$bait} < $umisByBaitAdj{$_}{Mut}{$bait} ) {
-      $umisByBaitAdj{$_}{All}{$bait} = $umisByBaitAdj{$_}{Mut}{$bait};
+    if( $umisByBaitAdj{$_}{All}{$bait} + $umisByBait{$_}{All}{$bait} < 
+	$umisByBaitAdj{$_}{Mut}{$bait} + $umisByBait{$_}{Mut}{$bait} ) {
+      $umisByBaitAdj{$_}{All}{$bait} = $umisByBaitAdj{$_}{Mut}{$bait} +
+	  $umisByBait{$_}{Mut}{$bait} - $umisByBait{$_}{All}{$bait};
     }
   }
 }
