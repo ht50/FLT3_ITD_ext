@@ -1667,7 +1667,8 @@ while(<FI>){
 
 	$cigar = $line_cells[5];
 	if( $cigar =~ /^(\d+)H(.*)H$/ ) { next; }
-	$readlengths{length( $line_cells[9] )} += 1;
+	# For Archer, assume GSP2s are on R2
+	if( $ngstype ne "Archer" || $readsuffix eq "_2" ) { $readlengths{length( $line_cells[9] )} += 1; }
 	my $rpos = $line_cells[3]-1; 
 	while( $cigar =~ /(\d+)([SHDIMN])(.*)/ ) {
 	    $cigar = $3;
