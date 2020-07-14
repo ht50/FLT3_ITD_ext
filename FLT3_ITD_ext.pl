@@ -974,6 +974,10 @@ sub proc_alignment_dets_hash {
 
     my @cdotL1 = proc_to_cdot_coords( $leftr1 );
     my @cdotR0 = proc_to_cdot_coords( $rightr0 );
+    $cdet{dup_r0} = $rightr0;
+    $cdet{dup_r1} = $leftr1;
+    $cdet{mutbk_s0} = $leftr1;
+
     if( $rightr0 > $leftr1 ) {
 	$cdet{dup_r0} = $leftr1;
 	$cdet{dup_r1} = $rightr0;
@@ -1152,9 +1156,6 @@ sub proc_alignment_dets_hash {
 	if( length($leftmm)>0 ) { $cdet{keyrdot} .= "|left(r." . $leftmm . ")"; }
 	if( length($rightmm1)>0 ) { $cdet{keyrdot} .= "|right(r." . $rightmm1 . ")"; }
 	
-	$cdet{dup_r0} = $rightr0;
-	$cdet{dup_r1} = $leftr1;
-	$cdet{mutbk_s0} = $leftr1;
 	if( scalar(@cells) == 3 ) {
 	    $cdet{insseq} = substr($cells[1],3);
 	    $cdet{inslen} = length($cdet{insseq});
@@ -1262,13 +1263,16 @@ sub proc_alignment_dets_hash {
 	}
     } else {
 	my $insstr = "";
+	my $inslen = 0;
 	for( my $i=1; $i<scalar(@cells)-1; $i++ ) {
 	    if( length($insstr)>0 ) { $insstr .= "/"; }
 	    if( substr($cells[$i],0,3) eq "ins" ) {
 		$insstr .= substr($cells[$i],3);
+		$inslen += length(substr($cells[$i],3));
 	    } elsif( substr($cells[$i],0,3) eq "ref" ) {
 		@subcells = split(/\(/, substr($cells[$i],3) );
 		@subsubcells = split(/\-/, $subcells[0]);
+		$inslen += $subsubcells[1]-$subsubcells[0]+1;
 		my @cdot0 = proc_to_cdot_coords( $subsubcells[0] );
 		my @cdot1 = proc_to_cdot_coords( $subsubcells[1] );
 		if( length($cdot0[0])>0 && length($cdot1[0])>0 ) {
@@ -1297,6 +1301,9 @@ sub proc_alignment_dets_hash {
 		}
 	    }
 
+	    $cdet{insseq} = "needs_manual_review";
+	    $cdet{inslen} = $inslen;
+	    $cdet{mutbk_s1} = $cdet{mutbk_s0} + $inslen + 1;
 	    $cdet{keycdot} = "c." . $cdotL1[0] . "_" . increment_cdot_coord($cdotL1[0]) . "ins" . 
 		$insstr . "/" . $cdotR0[0] . "-" . $cdotL1[0];
 	    $cdet{keycdotalt} = "c." . decrement_cdot_coord($cdotR0[0]) . "_" . $cdotR0[0] . "ins" .
@@ -3155,11 +3162,29 @@ foreach my $cname ( keys %itdkeysfiltered ) {
     $auAFsum += $coverageTots{$cname}{auAF};
 }
 
-# May need to consider edge cases where $rAFsum, $uAFsum, or $auAFsum is greater than 1
+# May need to re-consider edge cases where $rAFsum, $uAFsum, or $auAFsum is greater than 1 (e.g. alternatively scale down)
 foreach my $cname (keys %itdkeysfiltered) {
-  if( $rAFsum != 1 ) { $coverageTots{$cname}{rAR} = $coverageTots{$cname}{rAF}/(1-$rAFsum); } else { $coverageTots{$cname}{rAR} = "Inf"; }
-  if( $uAFsum != 1 ) { $coverageTots{$cname}{uAR} = $coverageTots{$cname}{uAF}/(1-$uAFsum); } else { $coverageTots{$cname}{uAR} = "Inf"; };
-  if( $auAFsum != 1 ) { $coverageTots{$cname}{auAR} = $coverageTots{$cname}{auAF}/(1-$auAFsum); } else { $coverageTots{$cname}{auAR} = "Inf"; } 
+  if( $rAFsum < 1 ) {
+      $coverageTots{$cname}{rAR} = $coverageTots{$cname}{rAF}/(1-$rAFsum);
+  } elsif( $coverageTots{$cname}{rAF} < 1 ) {
+      $coverageTots{$cname}{rAR} = $coverageTots{$cname}{rAF}/(1-$coverageTots{$cname}{rAF});
+  } else {
+      $coverageTots{$cname}{rAR} = "Inf";
+  }
+  if( $uAFsum < 1 ) {
+      $coverageTots{$cname}{uAR} = $coverageTots{$cname}{uAF}/(1-$uAFsum);
+  } elsif( $coverageTots{$cname}{uAF} < 1 ) {
+      $coverageTots{$cname}{uAR} = $coverageTots{$cname}{uAF}/(1-$coverageTots{$cname}{uAF});
+  } else {
+      $coverageTots{$cname}{uAR} = "Inf";
+  }
+  if( $auAFsum < 1 ) {
+      $coverageTots{$cname}{auAR} = $coverageTots{$cname}{auAF}/(1-$auAFsum);
+  } elsif( $coverageTots{$cname}{auAF} < 1 ) {
+      $coverageTots{$cname}{auAR} = $coverageTots{$cname}{auAF}/(1-$coverageTots{$cname}{auAF}); 
+  } else {
+      $coverageTots{$cname}{auAR} = "Inf";
+  }
 }
 
 # Remove itds with no mutant reads and flag ITDs where neither endpoints is within an exon + buffer
