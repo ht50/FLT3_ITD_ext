@@ -88,6 +88,7 @@ my $clustercmd = "sumaclust";
 my $javacmd = "java"; # the java cmd needs to be in $PATH (e.g. "/apps/java/jdk1.8.0_191/bin/java";)
 my $fgbiojar = "fgbio.jar";
 my $trimcmd = "bbduk.sh";
+my $picardjar = "picard.jar";
 
 my $minToCluster = 1;
 my $maxEditDist = 5;  
@@ -1783,8 +1784,10 @@ if( $umitag ne "" ) {
   }
   close FO;
 
-  if( system( sprintf( "%s view -bT %s %s_wt.sam | %s sort -n -o %s_wt.bam", 
-	$samcmd, $reffasta, $fbase, $samcmd, $fbase ) ) ) {
+  if( system( sprintf( "%s view -bT %s %s_wt.sam | " .
+                       "%s -jar %s SortSam I=/dev/stdin SO=queryname O=/dev/stdout | " .
+                       "%s -jar %s SetMateInformation -i /dev/stdin -o %s_wt.bam",
+        $samcmd, $reffasta, $fbase, $javacmd, $picardjar, $javacmd, $fgbiojar, $fbase ) ) ) {
     die "Failed to convert wt sam to bam. Exiting...\n";
   }
 
@@ -2390,7 +2393,10 @@ foreach( sort keys %resolvedMutPaired ) {
 close FO;
 
 if( $umitag ne "" ) {
-  if( system( sprintf( "%s view -bS %s_to_candidate_ITDs.filtered.sam | %s sort -n -o %s_mut.bam", $samcmd, $fbase, $samcmd, $fbase ) ) ) {
+  if( system( sprintf( "%s view -bS %s_to_candidate_ITDs.filtered.sam | " .
+                       "%s -jar %s SortSam I=/dev/stdin SO=queryname O=/dev/stdout | " .
+                       "%s -jar %s SetMateInformation -i /dev/stdin -o %s_mut.bam",
+              $samcmd, $fbase, $javacmd, $picardjar, $javacmd, $fgbiojar, $fbase ) ) ) {
     die "Failed to convert mutant sam to bam. Exiting...\n";
   }
 
