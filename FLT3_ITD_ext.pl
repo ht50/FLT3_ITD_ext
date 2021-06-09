@@ -1518,7 +1518,7 @@ if( length($inbam) > 0 ) {
 
   if( $typeb eq "targeted" || $typeb eq "loose" ) {
     # get chr13 name from bam file
-    if( system( sprintf( "%s view -H %s | grep 'SN:chr13\\|SN:13' | grep -v 'SN:chr13_\\|SN:13_' > %s_header_chr13.txt", $samcmd, $inbam, $fbase ) ) ) {
+    if( system( sprintf( "%s view -H %s | grep -w 'SN:chr13\\|SN:13' > %s_header_chr13.txt", $samcmd, $inbam, $fbase ) ) ) {
       die "Failed to extract header from original input bam. Exiting...\n";
     }
     open(FI, $fbase . "_header_chr13.txt" ) or die $!;
